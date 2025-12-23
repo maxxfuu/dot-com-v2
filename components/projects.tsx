@@ -41,7 +41,7 @@ const projects: Record<string, Project> = {
   },
   project4: {
     title: "Bcon",
-    description: "Bcon hexadecimal binary decimal converter",
+    description: "A C based CLI tool that can convert data between binary value, hexadecimal, and decimal value.",
     image: "/bcon.png",
     video: "/bcon.mp4",
     type: "popup",
@@ -93,7 +93,7 @@ export function Projects() {
               alt={value.title}
               width={500}
               height={300}
-              className="w-full object-cover border-b rounded-t-sm hover:scale-103 transition-all duration-300 cursor-pointer"
+              className="w-full h-40 object-cover border-b rounded-t-sm hover:scale-103 transition-all duration-300 cursor-pointer"
             />
             <CardHeader>
               <CardTitle>{value.title}</CardTitle>
