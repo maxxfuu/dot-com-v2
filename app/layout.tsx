@@ -18,9 +18,24 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Max Fu",
-  description: "",
+  description: "Software Engineer, Entrepreneur, and Student.",
   icons: {
     icon: "/favicon.ico",
+  },
+  openGraph: {
+    title: "Max Fu",
+    description: "Software Engineer, Entrepreneur, and Student.",
+    siteName: "Max Fu",
+    images: [
+      {
+        url: "/favicon.ico", // Using favicon as requested, though a PNG is recommended for better compatibility
+        width: 1200,
+        height: 630,
+        alt: "Max Fu",
+      },
+    ],
+    locale: "en_US",
+    type: "website",
   },
 };
 
