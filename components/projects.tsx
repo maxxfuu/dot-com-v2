@@ -50,6 +50,7 @@ const projects: Record<string, Project> = {
 }
 
 import type { SVGProps } from "react";
+import { motion } from "framer-motion";
 
 const GitHub = (props: SVGProps<SVGSVGElement>) => (
   <svg {...props} viewBox="0 0 1024 1024" fill="none">
@@ -119,17 +120,35 @@ export function Projects() {
             </video>
           </div>
           <DialogFooter className="sm:justify-start">
-            <div className="flex w-full gap-2">
-              <Button variant="default" className="flex-2 cursor-pointer" asChild>
+          <div className="flex w-full gap-2">
+            <motion.div
+              className="flex-[2]"  
+              whileTap={{ scale: 0.98 }}
+              transition={{ duration: 0.2 }}
+            >
+              <Button variant="default" className="w-full cursor-pointer" asChild>
                 <Link href={currentProject?.github || "#"} target="_blank">
                   <GitHub />
                   GitHub
                 </Link>
               </Button>
-              <Button variant="secondary" className="flex-1 cursor-pointer hover:bg-gray-200" onClick={() => setSelectedProject(null)}>
+            </motion.div>
+
+            <motion.div
+              className="flex-1"
+              whileTap={{ scale: 0.98 }}
+              transition={{ duration: 0.2 }}
+            >
+              <Button
+                variant="secondary"
+                className="w-full cursor-pointer hover:bg-gray-200"
+                onClick={() => setSelectedProject(null)}
+              >
                 Cancel
               </Button>
-            </div>
+            </motion.div>
+          </div>
+
           </DialogFooter>
         </DialogContent>
       </Dialog>
