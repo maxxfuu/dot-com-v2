@@ -115,7 +115,7 @@ export function Experience() {
             <TimelineContent>
               <TimelineTime>June 2023 - Aug 2023</TimelineTime>
               <TimelineTitle className="font-semibold">
-                Moved from Taichung 🇹🇼 to California 🇺🇸
+                Moved from Taichung to California
               </TimelineTitle>
             </TimelineContent>
           </MotionTimelineItem>
