@@ -103,7 +103,6 @@ export function Projects() {
           </Card>
         ))}
       </div>
-
       <Dialog open={!!selectedProject} onOpenChange={(open) => !open && setSelectedProject(null)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
