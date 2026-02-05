@@ -40,7 +40,7 @@ export function Experience() {
                 Co-founder to a <span className="font-semibold">Productivity Platform</span>
               </TimelineTitle>
               <TimelineDescription>
-                Bootstrapped a SaaS company and scaling it to 10k MRR
+                Bootstrapping my way to 10k MRR
               </TimelineDescription>
             </TimelineContent>
           </MotionTimelineItem>
