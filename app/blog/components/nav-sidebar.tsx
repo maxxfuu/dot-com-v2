@@ -91,7 +91,7 @@ export function NavSidebar() {
   return (
     <nav
       ref={sidebarRef}
-      className="fixed left-8 top-1/2 -translate-y-1/2 z-50 flex flex-col transition-all duration-300 ease-out"
+      className="fixed left-8 top-1/2 -translate-y-1/2 z-50 flex flex-col transition-all duration-180 ease-in-out"
       style={{ gap: isHovered ? "12px" : "2px" }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
@@ -116,7 +116,7 @@ export function NavSidebar() {
             {/* Bar (default state) */}
             <div
               className={cn(
-                "absolute left-0 bg-neutral-800 dark:bg-neutral-200 rounded-full transition-all duration-200 ease-out",
+                "absolute left-0 bg-neutral-800 dark:bg-neutral-200 rounded-full transition-all duration-180 ease-in-out",
                 isHovered && "opacity-0 blur-md scale-0"
               )}
               style={{
@@ -129,7 +129,7 @@ export function NavSidebar() {
             {/* Year label (hover state) - emerges from left where bars are */}
             <span
               className={cn(
-                "absolute left-0 text-sm font-medium transition-all duration-200 ease-out whitespace-nowrap",
+                "absolute left-0 text-sm font-medium transition-all duration-180 ease-in-out whitespace-nowrap",
                 isHovered
                   ? "opacity-100 blur-0 scale-100"
                   : "opacity-0 blur-md scale-0",
