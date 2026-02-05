@@ -2,7 +2,7 @@ import Link from "next/link";
 
 export function Navbar() {
   return (
-    <nav className="max-w-full sticky top-0 z-50 bg-background/95 opacity-85 backdrop-blur">
+    <nav className="max-w-full sticky top-0 z-50 bg-background/95 opacity-85 backdrop-blur px-8">
       <div className="max-w-xl mx-auto flex justify-between items-center h-12">
         <Link href="/" className="text-sm font-bold">me@maxxfuu.com</Link>
         <ul className="flex space-x-4">

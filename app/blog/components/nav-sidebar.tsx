@@ -91,8 +91,8 @@ export function NavSidebar() {
   return (
     <nav
       ref={sidebarRef}
-      className="fixed left-8 top-1/2 -translate-y-1/2 z-50 flex flex-col transition-all duration-180 ease-in-out"
-      style={{ gap: isHovered ? "12px" : "2px" }}
+      className="fixed left-8 top-1/2 -translate-y-1/2 z-50 flex flex-col transition-all duration-180 ease-in-out hidden md:flex"
+      style={{ gap: isHovered ? "20px" : "2px" }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
     >
@@ -101,7 +101,7 @@ export function NavSidebar() {
         const isActive = index === activeIndex;
 
         // Bar width based on progress (16px to 32px)
-        const barWidth = 10 + progress * 12;
+        const barWidth = 10 + progress * 16;
         // Opacity based on progress
         const opacity = 0.2 + progress * 0.8;
 
