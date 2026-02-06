@@ -32,7 +32,7 @@ export function Experience() {
         <Timeline>
           <MotionTimelineItem variants={itemVariants}>
             <TimelineConnector>
-              <TimelineDot className="bg-black" active />
+              <TimelineDot className="bg-black dark:bg-white" active />
             </TimelineConnector>
             <TimelineContent>
               <TimelineTime>Sep 2025 - Present</TimelineTime>
@@ -47,7 +47,7 @@ export function Experience() {
 
           <MotionTimelineItem variants={itemVariants}>
             <TimelineConnector>
-              <TimelineDot className="bg-black/80" />
+              <TimelineDot className="bg-black/80 dark:bg-white/80" />
             </TimelineConnector>
             <TimelineContent>
               <TimelineTime>May 2025 - Aug 2025</TimelineTime>
@@ -65,7 +65,7 @@ export function Experience() {
 
           <MotionTimelineItem variants={itemVariants}>
             <TimelineConnector>
-              <TimelineDot className="bg-black/60" />
+              <TimelineDot className="bg-black/60 dark:bg-white/60" />
             </TimelineConnector>
             <TimelineContent>
               <TimelineTime>Aug 2024 - Dec 2024</TimelineTime>
@@ -80,7 +80,7 @@ export function Experience() {
 
           <MotionTimelineItem variants={itemVariants}>
             <TimelineConnector>
-              <TimelineDot className="bg-black/40" />
+              <TimelineDot className="bg-black/40 dark:bg-white/40" />
             </TimelineConnector>
             <TimelineContent>
               <TimelineTime>Aug 2024 - Dec 2024</TimelineTime>
@@ -95,7 +95,7 @@ export function Experience() {
 
           <MotionTimelineItem variants={itemVariants}>
             <TimelineConnector>
-              <TimelineDot className="bg-black/20" />
+              <TimelineDot className="bg-black/20 dark:bg-white/20" />
             </TimelineConnector>
             <TimelineContent>
               <TimelineTime>Oct 2023 - Oct 2024</TimelineTime>
@@ -110,7 +110,7 @@ export function Experience() {
 
           <MotionTimelineItem variants={itemVariants}>
             <TimelineConnector>
-              <TimelineDot className="bg-black/10" />
+              <TimelineDot className="bg-black/10 dark:bg-white/10" />
             </TimelineConnector>
             <TimelineContent>
               <TimelineTime>June 2023 - Aug 2023</TimelineTime>
