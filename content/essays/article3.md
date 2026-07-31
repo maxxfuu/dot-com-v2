@@ -1,0 +1,9 @@
+---
+title: "The Intuition Behind CUDA Hardware and Memory for the sake of optimizng GPU Kernels"
+date: "2026-07-28"
+summary: ""
+---
+
+![Sequential access — one row, adjacent elements.](/videos/dram/dram-physics-1-sequential.mp4)
+
+![Strided access — a new row for every element.](/videos/dram/dram-physics-2-strided.mp4)
