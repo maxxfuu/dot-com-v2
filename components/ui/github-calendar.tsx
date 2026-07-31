@@ -117,7 +117,7 @@ export function GithubCalendar({
             try {
                 setLoading(true)
                 const response = await fetch(
-                    `https://github-contributions-api.deno.dev/${username}.json`
+                    `/api/github-contributions?username=${username}`
                 )
                 if (!response.ok) {
                     throw new Error("Failed to fetch GitHub data")
