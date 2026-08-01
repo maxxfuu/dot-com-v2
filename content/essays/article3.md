@@ -1,6 +1,6 @@
 ---
 title: "The Intuition Behind CUDA Hardware and Memory for the sake of optimizng GPU Kernels"
-date: "2026-07-28"
+date: "2026-07-31"
 summary: ""
 ---
 

@@ -39,9 +39,9 @@ type ExperienceEntry = {
 
 const experiences: ExperienceEntry[] = [
   {
-    time: "Jan 2026 - Present",
-    title: <>Co-Founder of a <span className="text-foreground">Health Platform</span></>,
-    description: "Building an AI-native application that improves posture through the lens of biomechanics.",
+    time: "May 2026 - Present",
+    title: <>Kernel Engineering at <span className="text-foreground">7labs</span></>,
+    description: "Working on GPU kernels and runtime inference for large language models at 7labs.",
   },
   {
     time: "May 2025 - Aug 2025",

@@ -22,14 +22,18 @@ export default function Page() {
         </h1>
         <div className="my-8 space-y-6 text-base leading-[1.85] text-foreground md:text-[1.05rem]">
           <p>
-            Growing up, I was always intrigued in working on technically challenging and visually appealing projects. Fast forward to today, I have built a
-             <HoverCard>
-              <HoverCardTrigger> <span className="border-b border-dashed border-muted-foreground text-foreground transition-colors hover:border-foreground cursor-pointer">collection</span></HoverCardTrigger>
+            I&apos;m a student at UC Merced. I&apos;ve always been drawn to
+            work that&apos;s both technically challenging and visually
+            appealing, and chasing it has left me with a{" "}
+            <HoverCard>
+              <HoverCardTrigger asChild>
+                <span className={`${inlineLink} cursor-pointer`}>collection</span>
+              </HoverCardTrigger>
               <HoverCardContent>
                 <p className="font-semibold">Achievements and interests:</p>
                 <ul>
-                  <li>- Inference Engineering</li>
-                  <li>- Cooking </li>
+                  <li>- Kernel Engineering</li>
+                  <li>- Cooking</li>
                   <li>- Powerlifting</li>
                   <li>- Cardistry</li>
                   <li>- Animation Design</li>
@@ -39,14 +43,17 @@ export default function Page() {
                   <li>- Golfing</li>
                 </ul>
               </HoverCardContent>
-            </HoverCard>
-            {} of interests and achievements driven by passion. Over time, that fascination grew into a broader obsession with mastery and execution across different domains.
-            <br /><br />
-            <p>
-              Lately, that obsession has pulled me deep into the world of model performance, CUDA, inference infrastructure, and everything in between across the inference stack. I'm learning as much as I can, as fast as I can. I'd love to connect with anyone further along this path who's open to sharing what they know while building a connection along the way.
-            </p>
-            <br />
-            I hope in sharing my work and experiences, you can also feel the same delight and joy in the things that I'm passionate about.
+            </HoverCard>{" "}
+            of interests, and an obsession with mastery across every one of
+            them.
+          </p>
+          <p>
+            Lately, that obsession has pulled me deep into CUDA and kernel
+            engineering, model performance, inference infrastructure,
+            and everything in between. I&apos;m learning as much as I can, as
+            fast as I can, and I&apos;d love to connect with anyone further
+            along this path. I hope that in sharing my work, you feel some of the same delight I
+            find in it.
           </p>
         </div>
         <Link href="/essays" className="text-sm text-foreground transition-opacity hover:text-foreground flex items-center justify-end gap-2 mb-8">
