@@ -64,7 +64,7 @@ export default function Page() {
         <div className="mt-16">
           <Calendar />
           <Experience /> 
-          <Projects limit={2} showViewAll />
+          <Projects limit={4} showViewAll />
         </div>
       </header>
     </main>

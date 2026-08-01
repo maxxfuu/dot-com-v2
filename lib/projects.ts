@@ -10,6 +10,22 @@ export interface Project {
 
 export const projects: Project[] = [
   {
+    title: "VisualGPU",
+    description:
+      "An interactive, memory-first curriculum for GPU programming and inference performance, from bytes and caches to kernels and tokens per second",
+    image: "/visualgpu.png",
+    type: "image",
+    link: "https://visualgpu.com",
+  },
+  {
+    title: "VisualKernels",
+    description:
+      "Turns your C/CUDA kernels into a live, steppable 3D view of your buffers — watch every thread, loop, and buffer update as it happens",
+    image: "/visualkernels.png",
+    type: "image",
+    link: "https://visualkernels.com",
+  },
+  {
     title: "Bookie",
     description:
       "A local-first ledger that tracks every eval fee, reset, refund, and payout across prop trading firms — cost per funded account, recovery ratio, and your exact breakeven point",

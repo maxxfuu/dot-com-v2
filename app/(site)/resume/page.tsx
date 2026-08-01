@@ -27,9 +27,9 @@ export default function ResumePage() {
       </header>
 
       <iframe
-        src="/resume.pdf"
+        src="/resume.pdf#toolbar=0&navpanes=0&view=FitH"
         title="Max Fu Resume"
-        className="h-[calc(100vh-16rem)] w-full border border-border bg-background"
+        className="aspect-[8.5/11] w-full border border-border bg-background"
       />
     </main>
   );
