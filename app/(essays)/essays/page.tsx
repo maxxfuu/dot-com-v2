@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
-import { formatBlogDate, getBlogPosts } from "@/lib/blog";
+import { formatBlogDate, getEssayIndex } from "@/lib/blog";
 import { createPageMetadata } from "@/lib/metadata";
 
 export const metadata: Metadata = createPageMetadata({
@@ -10,7 +10,7 @@ export const metadata: Metadata = createPageMetadata({
 });
 
 export default async function Essays() {
-  const posts = await getBlogPosts();
+  const posts = await getEssayIndex();
 
   return (
     <main className="mx-auto max-w-2xl px-6 pb-24 pt-12 md:px-10 md:pt-16">

@@ -13,15 +13,18 @@ export const contentType = essayOgContentType;
 export async function generateStaticParams() {
   const posts = await getBlogPosts();
   return posts
-    .filter((post) => !post.series)
-    .map((post) => ({ slug: post.slug }));
+    .filter((post) => post.series)
+    .map((post) => {
+      const [slug, page] = post.slug.split("/");
+      return { slug, page };
+    });
 }
 
 export default async function Image({
   params,
 }: {
-  params: Promise<{ slug: string }>;
+  params: Promise<{ slug: string; page: string }>;
 }) {
-  const { slug } = await params;
-  return renderEssayOgImage(slug);
+  const { slug, page } = await params;
+  return renderEssayOgImage(`${slug}/${page}`);
 }

@@ -1,23 +1,71 @@
 import type { ReactNode } from "react";
 import { Fragment } from "react";
+import { CheckUnderstanding } from "@/app/(essays)/essays/components/check-understanding";
+
+const referenceAccentColor = "#036FFF";
+
+// code span | footnote marker | [text](url) | bare url
+const inlineTokenPattern =
+  /(`[^`]+`)|\[\^(\d+)\]|\[([^\]]+)\]\(([^)\s]+)\)|(https?:\/\/[^\s)]+)/g;
 
 function renderInlineMarkdown(text: string) {
-  const parts = text.split(/(`[^`]+`)/g);
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
 
-  return parts.map((part, index) => {
-    if (part.startsWith("`") && part.endsWith("`")) {
-      return (
-        <code
-          key={`${part}-${index}`}
-          className="font-mono text-[0.9em] text-muted-foreground"
-        >
-          {part.slice(1, -1)}
-        </code>
+  for (const match of text.matchAll(inlineTokenPattern)) {
+    if (match.index > lastIndex) {
+      nodes.push(
+        <Fragment key={`text-${lastIndex}`}>
+          {text.slice(lastIndex, match.index)}
+        </Fragment>
       );
     }
 
-    return <Fragment key={`${part}-${index}`}>{part}</Fragment>;
-  });
+    const [token, codeSpan, refNumber, linkText, linkHref, bareUrl] = match;
+
+    if (codeSpan) {
+      nodes.push(
+        <code
+          key={`code-${match.index}`}
+          className="font-mono text-[0.9em] text-muted-foreground"
+        >
+          {codeSpan.slice(1, -1)}
+        </code>
+      );
+    } else if (refNumber) {
+      nodes.push(
+        <sup key={`ref-${match.index}`}>
+          <a
+            href={`#ref-${refNumber}`}
+            className="font-sans text-[0.72em] font-medium no-underline"
+            style={{ color: referenceAccentColor }}
+          >
+            {refNumber}
+          </a>
+        </sup>
+      );
+    } else {
+      nodes.push(
+        <a
+          key={`link-${match.index}`}
+          href={linkHref ?? bareUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="underline decoration-foreground/30 underline-offset-[3px] transition-colors hover:decoration-foreground"
+        >
+          {linkText ?? bareUrl}
+        </a>
+      );
+    }
+
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(<Fragment key={`text-${lastIndex}`}>{text.slice(lastIndex)}</Fragment>);
+  }
+
+  return nodes;
 }
 
 function normalizeHeading(text: string) {
@@ -30,7 +78,19 @@ interface BlogMarkdownProps {
 }
 
 export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
-  const lines = body.split("\n");
+  // Reference definitions ("[^1]: <source>") can live anywhere in the file;
+  // they are pulled out here and rendered as a References section at the end.
+  const references = new Map<string, string>();
+  const lines = body.split("\n").filter((line) => {
+    const referenceMatch = line.match(/^\[\^(\d+)\]:\s*(.+)$/);
+
+    if (referenceMatch) {
+      references.set(referenceMatch[1], referenceMatch[2]);
+      return false;
+    }
+
+    return true;
+  });
   const elements: ReactNode[] = [];
   let index = 0;
 
@@ -65,6 +125,50 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       );
 
       index += 1;
+      continue;
+    }
+
+    // Check-your-understanding block:
+    // :::check
+    // <question>
+    // ---
+    // <answer>
+    // :::
+    if (line.trim() === ":::check") {
+      const questionLines: string[] = [];
+      const answerLines: string[] = [];
+      let target = questionLines;
+      index += 1;
+
+      while (index < lines.length && lines[index].trim() !== ":::") {
+        if (lines[index].trim() === "---") {
+          target = answerLines;
+        } else {
+          target.push(lines[index]);
+        }
+        index += 1;
+      }
+
+      index += 1;
+
+      const answerParagraphs = answerLines
+        .join("\n")
+        .trim()
+        .split(/\n\s*\n/)
+        .filter(Boolean);
+
+      elements.push(
+        <CheckUnderstanding
+          key={`check-${index}`}
+          question={renderInlineMarkdown(questionLines.join(" ").trim())}
+          answer={answerParagraphs.map((paragraph, paragraphIndex) => (
+            <p key={paragraphIndex}>
+              {renderInlineMarkdown(paragraph.replace(/\n/g, " "))}
+            </p>
+          ))}
+        />
+      );
+
       continue;
     }
 
@@ -206,6 +310,7 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       lines[index] !== ">" &&
       !lines[index].startsWith("- ") &&
       !lines[index].startsWith("```") &&
+      !lines[index].trim().startsWith(":::") &&
       !lines[index].trim().startsWith("![")
     ) {
       paragraphLines.push(lines[index]);
@@ -219,6 +324,29 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       >
         {renderInlineMarkdown(paragraphLines.join(" "))}
       </p>
+    );
+  }
+
+  if (references.size > 0) {
+    elements.push(
+      <section key="references" className="mt-16! border-t border-border pt-8">
+        <h2 className="font-sans text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+          References
+        </h2>
+        <ol className="mt-5 space-y-3 text-[0.95rem] leading-relaxed text-muted-foreground">
+          {[...references.entries()].map(([number, content]) => (
+            <li key={number} id={`ref-${number}`} className="flex gap-3 scroll-mt-24">
+              <span
+                className="shrink-0 font-sans text-xs leading-6"
+                style={{ color: referenceAccentColor }}
+              >
+                {number}
+              </span>
+              <span className="min-w-0 break-words">{renderInlineMarkdown(content)}</span>
+            </li>
+          ))}
+        </ol>
+      </section>
     );
   }
 

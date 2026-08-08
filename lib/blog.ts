@@ -10,6 +10,9 @@ export interface BlogPost {
   summary: string;
   body: string;
   href: string;
+  // Set when the post is one page of a multi-page essay (a subdirectory of content/essays).
+  series: string | null;
+  pageNumber: number | null;
 }
 
 function normalizeDashes(value: string) {
@@ -73,11 +76,21 @@ export async function getBlogPosts(): Promise<BlogPost[]> {
       const fullPath = path.join(blogContentDirectory, relativePath);
       const fileContent = await fs.readFile(fullPath, "utf8");
       const { metadata, body } = parseFrontmatter(fileContent);
-      const slug = path.basename(relativePath, ".md");
+      const segments = relativePath.split(path.sep);
+      const slug = segments
+        .map((segment, index) =>
+          index === segments.length - 1 ? path.basename(segment, ".md") : segment
+        )
+        .join("/");
 
       if (!slug) {
         return null;
       }
+
+      const series = segments.length > 1 ? segments[0] : null;
+      const pageNumberMatch = series
+        ? path.basename(relativePath, ".md").match(/(\d+)$/)
+        : null;
 
       return {
         slug,
@@ -86,6 +99,8 @@ export async function getBlogPosts(): Promise<BlogPost[]> {
         summary: String(metadata.summary ?? ""),
         body,
         href: `/essays/${slug}`,
+        series,
+        pageNumber: pageNumberMatch ? Number(pageNumberMatch[1]) : null,
       };
     })
   );
@@ -99,6 +114,63 @@ export async function getBlogPost(slug: string) {
   const posts = await getBlogPosts();
 
   return posts.find((post) => post.slug === slug) ?? null;
+}
+
+// Index listing: standalone essays plus only the first page of each series.
+export async function getEssayIndex() {
+  const posts = await getBlogPosts();
+
+  return posts.filter(
+    (post) => !post.series || post === firstPage(posts, post.series)
+  );
+}
+
+function comparePages(a: BlogPost, b: BlogPost) {
+  if (a.pageNumber !== null && b.pageNumber !== null) {
+    return a.pageNumber - b.pageNumber;
+  }
+
+  return a.slug.localeCompare(b.slug);
+}
+
+function firstPage(posts: BlogPost[], series: string) {
+  return posts
+    .filter((post) => post.series === series)
+    .sort(comparePages)[0] ?? null;
+}
+
+export async function getSeriesFirstPage(series: string) {
+  return firstPage(await getBlogPosts(), series);
+}
+
+export interface SeriesNav {
+  prev: BlogPost | null;
+  next: BlogPost | null;
+  index: number;
+  total: number;
+}
+
+export async function getSeriesNav(post: BlogPost): Promise<SeriesNav | null> {
+  if (!post.series) {
+    return null;
+  }
+
+  const posts = await getBlogPosts();
+  const pages = posts
+    .filter((other) => other.series === post.series)
+    .sort(comparePages);
+  const index = pages.findIndex((page) => page.slug === post.slug);
+
+  if (index === -1 || pages.length < 2) {
+    return null;
+  }
+
+  return {
+    prev: pages[index - 1] ?? null,
+    next: pages[index + 1] ?? null,
+    index,
+    total: pages.length,
+  };
 }
 
 export function formatBlogDate(date: string) {
