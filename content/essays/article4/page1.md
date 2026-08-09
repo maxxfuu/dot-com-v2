@@ -19,7 +19,7 @@ While learning how to optimize a SGEMM kernel myself, I've noticed the majority 
 Its all about the memory hierachy and the movement of data with the CUDA software. The idea is simple, but the execution can be difficult. We will iteratively walk through the hardware components of a CUDA architecture all the way to optimizing a CUDA kernel. Below is the table of contents, feel free to skip to skip around although reading this sequentially is advised. 
 
 ### To write a CUDA Matmul Kernel That Reaches 90% of cuBLAS Performance
-1. [From GPU Hardware to High-Performance Kernels](/essays/article4/page2)
+1. [From CUDA Kernels to NVIDIAs GPU Hardware Architecture](/essays/article4/page2)
 2. [The Naive Kernel: Establishing a Baseline](/essays/article4/page3)
 3. [Global Memory Coalescing](/essays/article4/page4)
 4. [Flattening the Block](/essays/article4/page5)

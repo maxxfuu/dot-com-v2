@@ -149,3 +149,22 @@
   box-shadow: 0 0 0 8px color-mix(in srgb, #036fff 10%, transparent);
   color: var(--foreground);
 }
+/* Shiki emits both themes as custom properties (defaultColor: false), so the
+   class-based dark mode picks one here instead of re-highlighting. The
+   backgrounds stay transparent to keep the bordered, page-colored code block. */
+.code-block .shiki,
+.code-block .shiki span {
+  color: var(--shiki-light);
+  background-color: transparent !important;
+}
+
+.dark .code-block .shiki,
+.dark .code-block .shiki span {
+  color: var(--shiki-dark);
+}
+
+.code-block .shiki {
+  margin: 0;
+  padding: 0;
+  overflow-x: auto;
+}

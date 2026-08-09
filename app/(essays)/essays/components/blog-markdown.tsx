@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Fragment } from "react";
 import Link from "next/link";
 import { CheckUnderstanding } from "@/app/(essays)/essays/components/check-understanding";
+import { getHighlighter, highlightCode } from "@/lib/highlight";
 
 const referenceAccentColor = "#036FFF";
 
@@ -31,7 +32,9 @@ function renderInlineMarkdown(text: string) {
       nodes.push(
         <code
           key={`code-${match.index}`}
-          className="font-mono text-[0.9em] text-muted-foreground"
+          // Same hues the github-light/github-dark themes give keywords in the
+          // fenced blocks, so an identifier reads the same inline as in code.
+          className="font-mono text-[0.9em] text-[#d73a49] dark:text-[#f97583]"
         >
           {codeSpan.slice(1, -1)}
         </code>
@@ -104,7 +107,11 @@ interface BlogMarkdownProps {
   title?: string;
 }
 
-export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
+export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
+  // Awaited once up front so the parse loop below can stay synchronous —
+  // codeToHtml itself is sync on an already-created highlighter.
+  const highlighter = await getHighlighter();
+
   // Reference definitions ("[^1]: <source>") can live anywhere in the file;
   // they are pulled out here and rendered as a References section at the end.
   const references = new Map<string, string>();
@@ -130,7 +137,9 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
     }
 
     if (line.startsWith("```")) {
-      const language = line.slice(3).trim() || "text";
+      // A bare ``` fence renders unlabelled and unhighlighted — the right frame
+      // for ASCII diagrams, which are not code in any language.
+      const language = line.slice(3).trim();
       const codeLines: string[] = [];
       index += 1;
 
@@ -139,16 +148,30 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
         index += 1;
       }
 
+      const code = codeLines.join("\n");
+      const highlighted = highlightCode(highlighter, code, language);
+
       elements.push(
-        <pre
+        <div
           key={`code-${index}`}
-          className="my-10 overflow-x-auto border-y border-border py-6 font-mono text-sm leading-relaxed text-foreground"
+          className="my-10 border border-neutral-300 px-5 py-4 dark:border-neutral-700"
         >
-          <div className="mb-3 font-sans text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
-            {language}
-          </div>
-          <code>{codeLines.join("\n")}</code>
-        </pre>
+          {language ? (
+            <div className="mb-3 font-sans text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+              {language}
+            </div>
+          ) : null}
+          {highlighted ? (
+            <div
+              className="code-block overflow-x-auto font-mono text-sm leading-relaxed"
+              dangerouslySetInnerHTML={{ __html: highlighted }}
+            />
+          ) : (
+            <pre className="overflow-x-auto font-mono text-sm leading-relaxed text-foreground">
+              <code>{code}</code>
+            </pre>
+          )}
+        </div>
       );
 
       index += 1;
