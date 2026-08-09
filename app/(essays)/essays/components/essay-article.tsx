@@ -6,6 +6,9 @@ import { ArrowLeftIcon } from "lucide-react";
 
 export async function EssayArticle({ post }: { post: BlogPost }) {
   const seriesNav = await getSeriesNav(post);
+  // Title and date belong to the essay as a whole, so later pages of a series
+  // open straight into their body text. The summary is index-only.
+  const showHeader = !seriesNav || seriesNav.index === 0;
 
   return (
     <main className="mx-auto max-w-2xl px-6 pb-24 pt-12 md:px-10 md:pt-16">
@@ -16,19 +19,16 @@ export async function EssayArticle({ post }: { post: BlogPost }) {
       </div>
 
       <article>
-        <header className="mb-16 text-center">
-          <h1 className="text-4xl font-normal leading-[1.15] tracking-tight md:text-5xl">
-            {post.title}
-          </h1>
-          {post.summary ? (
-            <p className="mx-auto mt-6 max-w-lg text-lg leading-relaxed text-muted-foreground">
-              {post.summary}
+        {showHeader ? (
+          <header className="mb-16 text-center">
+            <h1 className="text-4xl font-normal leading-[1.15] tracking-tight md:text-5xl">
+              {post.title}
+            </h1>
+            <p className="mt-8 font-sans text-xs text-muted-foreground">
+              {formatBlogDate(post.date)}
             </p>
-          ) : null}
-          <p className="mt-8 font-sans text-xs text-muted-foreground">
-            {formatBlogDate(post.date)}
-          </p>
-        </header>
+          </header>
+        ) : null}
 
         <BlogMarkdown body={post.body} title={post.title} />
       </article>

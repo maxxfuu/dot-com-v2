@@ -121,8 +121,31 @@
   * {
     @apply border-border outline-ring/50;
   }
+  html {
+    scroll-behavior: smooth;
+  }
   body {
     @apply bg-background text-foreground antialiased;
     font-family: var(--font-serif), ui-serif, Georgia, serif;
   }
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
+}
+
+/* Footnote markers link to #ref-N; the targeted entry lights up. */
+.reference-item {
+  border-radius: 3px;
+  transition:
+    background-color 250ms ease,
+    box-shadow 250ms ease,
+    color 250ms ease;
+}
+
+.reference-item:target {
+  background-color: color-mix(in srgb, #036fff 10%, transparent);
+  box-shadow: 0 0 0 8px color-mix(in srgb, #036fff 10%, transparent);
+  color: var(--foreground);
 }

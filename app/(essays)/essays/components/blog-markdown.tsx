@@ -1,12 +1,15 @@
 import type { ReactNode } from "react";
 import { Fragment } from "react";
+import Link from "next/link";
 import { CheckUnderstanding } from "@/app/(essays)/essays/components/check-understanding";
 
 const referenceAccentColor = "#036FFF";
 
-// code span | footnote marker | [text](url) | bare url
+// code span | footnote marker | [text](url) | bare url | **bold** | *italic*
+// The emphasis markers are fenced by non-word lookaround so arithmetic in prose
+// ("2*M*N*K") is left alone; only a * that opens or closes a word counts.
 const inlineTokenPattern =
-  /(`[^`]+`)|\[\^(\d+)\]|\[([^\]]+)\]\(([^)\s]+)\)|(https?:\/\/[^\s)]+)/g;
+  /(`[^`]+`)|\[\^(\d+)\]|\[([^\]]+)\]\(([^)\s]+)\)|(https?:\/\/[^\s)]+)|(?<![A-Za-z0-9])\*\*([^*\s](?:[^*]*[^*\s])?)\*\*(?![A-Za-z0-9])|(?<![A-Za-z0-9])\*([^*\s](?:[^*]*[^*\s])?)\*(?![A-Za-z0-9])/g;
 
 function renderInlineMarkdown(text: string) {
   const nodes: ReactNode[] = [];
@@ -21,7 +24,8 @@ function renderInlineMarkdown(text: string) {
       );
     }
 
-    const [token, codeSpan, refNumber, linkText, linkHref, bareUrl] = match;
+    const [token, codeSpan, refNumber, linkText, linkHref, bareUrl, boldText, italicText] =
+      match;
 
     if (codeSpan) {
       nodes.push(
@@ -44,17 +48,38 @@ function renderInlineMarkdown(text: string) {
           </a>
         </sup>
       );
-    } else {
+    } else if (boldText) {
       nodes.push(
-        <a
-          key={`link-${match.index}`}
-          href={linkHref ?? bareUrl}
-          target="_blank"
-          rel="noreferrer"
-          className="underline decoration-foreground/30 underline-offset-[3px] transition-colors hover:decoration-foreground"
-        >
-          {linkText ?? bareUrl}
-        </a>
+        <strong key={`bold-${match.index}`} className="font-semibold">
+          {renderInlineMarkdown(boldText)}
+        </strong>
+      );
+    } else if (italicText) {
+      nodes.push(
+        <em key={`italic-${match.index}`}>{renderInlineMarkdown(italicText)}</em>
+      );
+    } else {
+      const href = linkHref ?? bareUrl;
+      const linkClassName =
+        "underline decoration-foreground/30 underline-offset-[3px] transition-colors hover:decoration-foreground";
+
+      // Site-relative links stay in the tab and use client-side navigation.
+      nodes.push(
+        href.startsWith("/") ? (
+          <Link key={`link-${match.index}`} href={href} className={linkClassName}>
+            {linkText ?? href}
+          </Link>
+        ) : (
+          <a
+            key={`link-${match.index}`}
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className={linkClassName}
+          >
+            {linkText ?? bareUrl}
+          </a>
+        )
       );
     }
 
@@ -67,6 +92,8 @@ function renderInlineMarkdown(text: string) {
 
   return nodes;
 }
+
+const orderedItemPattern = /^(\d+)\.\s+/;
 
 function normalizeHeading(text: string) {
   return text.trim().toLowerCase();
@@ -172,7 +199,7 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       continue;
     }
 
-    const headingMatch = line.match(/^(#{1,3})\s+(.*)$/);
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
 
     if (headingMatch) {
       const [, hashes, headingText] = headingMatch;
@@ -191,7 +218,7 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
         elements.push(
           <h2
             key={`h2-${index}`}
-            className="mt-16 mb-6 text-2xl font-normal tracking-tight text-foreground md:text-3xl"
+            className="mt-16 mb-6 text-2xl font-medium tracking-tight text-foreground md:text-3xl"
           >
             {renderInlineMarkdown(headingText)}
           </h2>
@@ -200,19 +227,28 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
         elements.push(
           <h3
             key={`h3-${index}`}
-            className="mt-12 mb-4 text-xl font-normal tracking-tight text-foreground md:text-2xl"
+            className="mt-12 mb-4 text-xl font-medium tracking-tight text-foreground md:text-2xl"
           >
             {renderInlineMarkdown(headingText)}
           </h3>
         );
-      } else {
+      } else if (level === 3) {
         elements.push(
           <h4
             key={`h4-${index}`}
-            className="mt-10 mb-3 text-lg font-normal tracking-tight text-foreground"
+            className="mt-10 mb-3 text-lg font-medium tracking-tight text-foreground"
           >
             {renderInlineMarkdown(headingText)}
           </h4>
+        );
+      } else {
+        elements.push(
+          <h5
+            key={`h5-${index}`}
+            className="mt-8 mb-3 text-base font-medium tracking-tight text-foreground"
+          >
+            {renderInlineMarkdown(headingText)}
+          </h5>
         );
       }
 
@@ -299,16 +335,41 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       continue;
     }
 
+    if (orderedItemPattern.test(line)) {
+      const items: string[] = [];
+      const start = Number(line.match(orderedItemPattern)![1]);
+
+      while (index < lines.length && orderedItemPattern.test(lines[index])) {
+        items.push(lines[index].replace(orderedItemPattern, ""));
+        index += 1;
+      }
+
+      elements.push(
+        <ol
+          key={`ordered-${index}`}
+          start={start}
+          className="my-8 ml-5 list-decimal space-y-3 text-base leading-[1.85] text-foreground"
+        >
+          {items.map((item, itemIndex) => (
+            <li key={`${item}-${itemIndex}`}>{renderInlineMarkdown(item)}</li>
+          ))}
+        </ol>
+      );
+
+      continue;
+    }
+
     const paragraphLines = [line];
     index += 1;
 
     while (
       index < lines.length &&
       lines[index].trim() &&
-      !lines[index].match(/^#{1,3}\s+/) &&
+      !lines[index].match(/^#{1,6}\s+/) &&
       !lines[index].startsWith("> ") &&
       lines[index] !== ">" &&
       !lines[index].startsWith("- ") &&
+      !orderedItemPattern.test(lines[index]) &&
       !lines[index].startsWith("```") &&
       !lines[index].trim().startsWith(":::") &&
       !lines[index].trim().startsWith("![")
@@ -335,7 +396,11 @@ export function BlogMarkdown({ body, title }: BlogMarkdownProps) {
         </h2>
         <ol className="mt-5 space-y-3 text-[0.95rem] leading-relaxed text-muted-foreground">
           {[...references.entries()].map(([number, content]) => (
-            <li key={number} id={`ref-${number}`} className="flex gap-3 scroll-mt-24">
+            <li
+              key={number}
+              id={`ref-${number}`}
+              className="reference-item flex gap-3 scroll-mt-32"
+            >
               <span
                 className="shrink-0 font-sans text-xs leading-6"
                 style={{ color: referenceAccentColor }}

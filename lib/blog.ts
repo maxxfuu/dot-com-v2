@@ -101,13 +101,41 @@ export async function getBlogPosts(): Promise<BlogPost[]> {
         href: `/essays/${slug}`,
         series,
         pageNumber: pageNumberMatch ? Number(pageNumberMatch[1]) : null,
+        // Only the first page of a series carries frontmatter; later pages
+        // inherit its title/date below so they are not left with slug fallbacks.
+        hasFrontmatter: metadata.title !== undefined,
       };
     })
   );
 
-  return posts
-    .filter((post): post is BlogPost => post !== null)
-    .sort((a, b) => b.date.localeCompare(a.date));
+  return inheritSeriesMetadata(
+    posts.filter((post): post is BlogPost & { hasFrontmatter: boolean } => post !== null)
+  ).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// A series page without its own frontmatter takes the series title, date, and
+// summary from the first page, so tab titles and OG images stay meaningful.
+function inheritSeriesMetadata(posts: (BlogPost & { hasFrontmatter: boolean })[]): BlogPost[] {
+  return posts.map(({ hasFrontmatter, ...post }) => {
+    if (hasFrontmatter || !post.series) {
+      return post;
+    }
+
+    const source = posts
+      .filter((other) => other.series === post.series && other.hasFrontmatter)
+      .sort(comparePages)[0];
+
+    if (!source) {
+      return post;
+    }
+
+    return {
+      ...post,
+      title: source.title,
+      date: source.date,
+      summary: source.summary,
+    };
+  });
 }
 
 export async function getBlogPost(slug: string) {
