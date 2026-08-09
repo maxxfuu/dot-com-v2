@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist_Mono, Figtree, Newsreader } from "next/font/google";
 import "./globals.css";
+import { ContentRefresh } from "@/components/content-refresh";
 import { SiteFooter } from "@/components/site-footer";
 import { SiteHeader } from "@/components/site-header";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -32,6 +33,7 @@ export default function RootLayout({
           <SiteHeader />
           {children}
           <SiteFooter />
+          {process.env.NODE_ENV === "development" ? <ContentRefresh /> : null}
         </ThemeProvider>
       </body>
     </html>

@@ -168,3 +168,38 @@
   padding: 0;
   overflow-x: auto;
 }
+
+/* Large, unscaled displays.
+   Tailwind's breakpoints stop at 2xl (1536px), so a 4K panel running at native
+   resolution — where the viewport really is 3840 CSS px — gets 16px body text
+   at ~140 DPI and reads tiny. Scaling the root font size lifts every rem-based
+   size at once, so the measure stays ~65-75 characters while the type grows;
+   the reading column widens in proportion rather than the line getting longer.
+
+   These only fire when the OS is NOT scaling the display. At 150% or 200%
+   scaling a 3840px panel reports a 2560px or 1920px viewport and is already
+   compensated, so it lands on a lower step or none at all. The height
+   conditions keep short ultrawides (3440x1440) from over-scaling. */
+@media (min-width: 1920px) {
+  html {
+    font-size: 17px;
+  }
+}
+
+@media (min-width: 2560px) and (min-height: 1200px) {
+  html {
+    font-size: 19px;
+  }
+}
+
+@media (min-width: 3200px) and (min-height: 1600px) {
+  html {
+    font-size: 21px;
+  }
+}
+
+@media (min-width: 3800px) and (min-height: 2000px) {
+  html {
+    font-size: 23px;
+  }
+}

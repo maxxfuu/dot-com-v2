@@ -157,7 +157,7 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
           className="my-10 border border-neutral-300 px-5 py-4 dark:border-neutral-700"
         >
           {language ? (
-            <div className="mb-3 font-sans text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+            <div className="mb-3 font-sans text-[0.625rem] uppercase tracking-[0.2em] text-muted-foreground">
               {language}
             </div>
           ) : null}
@@ -414,7 +414,7 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
   if (references.size > 0) {
     elements.push(
       <section key="references" className="mt-16! border-t border-border pt-8">
-        <h2 className="font-sans text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+        <h2 className="font-sans text-[0.6875rem] font-medium uppercase tracking-[0.2em] text-muted-foreground">
           References
         </h2>
         <ol className="mt-5 space-y-3 text-[0.95rem] leading-relaxed text-muted-foreground">

@@ -12,7 +12,7 @@ export function CheckUnderstanding({ question, answer }: CheckUnderstandingProps
 
   return (
     <aside className="my-12 rounded-lg border border-border bg-muted/40 px-6 py-5">
-      <p className="font-sans text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+      <p className="font-sans text-[0.6875rem] font-medium uppercase tracking-[0.2em] text-muted-foreground">
         Check your understanding
       </p>
 
