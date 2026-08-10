@@ -117,11 +117,11 @@ Which leaves the **thread**, and this is where the mapping runs out. There is no
 
 ## CUDA Execution Model
 
-On the software level, the thread is the smallest unit of execution. But on the hardware level, the smallest unit of execution is the **warp**: a group of 32 threads that the SM issues instructions for as one. A block is made up of multiple warps — a 1024-thread block is 32 of them.
+On the software level, the thread is the smallest unit of execution. But on the hardware level, the smallest unit of execution is the **warp**: a group of 32 threads that the SM issues instructions for as one. A block is made up of multiple warps - a 1024-thread block is 32 of them.
 
 ![The SM never schedules a thread on its own. It schedules one of these.](/images/gemm/block-splits-into-warps.png)
 
-You never declare a warp anywhere in your code. The hardware forms them for you by walking the block's threads in linear order — `threadIdx.x` first, then `y`, then `z` — and cutting every 32. Threads 0 through 31 become warp 0, threads 32 through 63 become warp 1, and so on down the block.
+You never declare a warp anywhere in your code. The hardware forms them for you by walking the block's threads in linear order - `threadIdx.x` first, then `y`, then `z` - and cutting every 32. Threads 0 through 31 become warp 0, threads 32 through 63 become warp 1, and so on down the block.
 
 Which also means a block whose size is not a multiple of 32 still pays for whole warps. Launch 1000 threads and you do not get 31.25 warps, you get 32, and the last one runs with 8 lanes doing work and 24 doing nothing at all. This is the first place the number 32 shows up in this article, and it is why the block dimensions in real kernels are almost always a multiple of it.
 
@@ -129,19 +129,19 @@ When a block arrives at an SM, the SM splits it into warps and schedules those. 
 
 ![The if-path and the else-path cannot run at the same time, so a divergent branch costs you the sum of both.](/images/gemm/warp-divergence.png)
 
-The qualifier that matters here is *inside a warp*. Divergence is a warp-level cost, not a program-level one. If warp 0 takes the if-path and warp 1 takes the else-path, nothing is serialized — they are separate scheduling units, and each one runs its own branch at full width. The expensive case is only when the condition comes out differently across the 32 lanes of a single warp.
+The qualifier that matters here is *inside a warp*. Divergence is a warp-level cost, not a program-level one. If warp 0 takes the if-path and warp 1 takes the else-path, nothing is serialized - they are separate scheduling units, and each one runs its own branch at full width. The expensive case is only when the condition comes out differently across the 32 lanes of a single warp.
 
 That distinction is worth carrying into the kernel we are about to write. A bounds guard like `if (row < M && col < N)` looks like a branch sitting on every thread, but when the matrix dimensions are multiples of the block size, every lane in a warp evaluates it identically and it costs a comparison and nothing more. Only the warps hanging off the edge of the matrix actually diverge, and there are very few of those.
 
 The other half of the model is latency hiding. Many warps sit resident on an SM at once, and the warp scheduler issues each cycle from whichever ones are ready. When one warp stalls waiting on a global memory load, the scheduler simply issues from another. A CPU spends enormous transistor budget on caches and out-of-order execution to avoid stalling; a GPU accepts the stall and keeps enough warps in flight that something is always runnable.
 
-![No single warp runs faster here — the memory latency is the same. The SM just always has some other warp ready to issue.](/images/gemm/latency-hiding.png)
+![No single warp runs faster here - the memory latency is the same. The SM just always has some other warp ready to issue.](/images/gemm/latency-hiding.png)
 
 The scale is what makes this work at all. A load that misses every cache and goes out to device memory takes many hundreds of cycles, while the FMA waiting on it takes a handful. Nothing you do inside one warp closes a gap that wide. The only thing that closes it is having other warps ready to issue in the meantime.
 
-And switching between them is free, which is the part worth sitting with. A CPU context switch has to save and restore registers, so it costs real time. A GPU never does that, because every resident warp already owns its registers in the register file for as long as it lives on the SM. The scheduler picks a different warp and issues on the next cycle. That is why the register file is so enormous, and it is also why asking for too many registers per thread hurts you — it does not make any individual thread slower, it means fewer warps fit on the SM, and warps are the only mechanism you have for covering memory latency.
+And switching between them is free, which is the part worth sitting with. A CPU context switch has to save and restore registers, so it costs real time. A GPU never does that, because every resident warp already owns its registers in the register file for as long as it lives on the SM. The scheduler picks a different warp and issues on the next cycle. That is why the register file is so enormous, and it is also why asking for too many registers per thread hurts you - it does not make any individual thread slower, it means fewer warps fit on the SM, and warps are the only mechanism you have for covering memory latency.
 
-This is what occupancy, which we met a moment ago, is actually measuring: how many warps are resident on an SM relative to the maximum it could hold. Note what that does and does not tell you. It is the *capacity* to hide latency, not proof that you are hiding any — which is why chasing occupancy on its own is not the same thing as chasing performance.[^4] We will run into that distinction directly once register pressure starts costing us residency.
+This is what occupancy, which we met a moment ago, is actually measuring: how many warps are resident on an SM relative to the maximum it could hold. Note what that does and does not tell you. It is the *capacity* to hide latency, not proof that you are hiding any - which is why chasing occupancy on its own is not the same thing as chasing performance.[^4] We will run into that distinction directly once register pressure starts costing us residency.
 
 Nearly every optimization in this article follows from the warp. Coalescing is about what one warp's 32 addresses look like to the memory system, bank conflicts are about what they look like to shared memory, and tiling is about giving each warp enough arithmetic to chew on while other warps wait.
 
