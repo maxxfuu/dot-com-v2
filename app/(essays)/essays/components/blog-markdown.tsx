@@ -137,6 +137,17 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       continue;
     }
 
+    // HTML comments are the only way to park a block of draft content in a
+    // markdown file. Skip them so they never leak out as paragraph text.
+    if (line.trim().startsWith("<!--")) {
+      while (index < lines.length && !lines[index].includes("-->")) {
+        index += 1;
+      }
+
+      index += 1;
+      continue;
+    }
+
     if (line.startsWith("```")) {
       // A bare ``` fence renders unlabelled and unhighlighted — the right frame
       // for ASCII diagrams, which are not code in any language.

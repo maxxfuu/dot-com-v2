@@ -22,6 +22,10 @@ A GPU contains multiple SMs. In the RTX 5080, the underlying GB203 die contains 
 
 Each SM is divided into four execution partitions, which we'll refer to as SM sub-partitions. Each sub-partition contains its own warp scheduler, instruction dispatch units, register file, CUDA cores, Tensor Cores, and load/store units. The SM also contains other important resources, including shared memory and L1 cache, which are shared across the SM's sub-partitions.
 
+<!--
+![One SM of the RTX 5080. Each of the four sub-partitions owns its own warp scheduler and register file. The 128 KB of L1 and shared memory along the bottom is the one resource all four have to share.](/images/gemm/sm-blackwell.png)
+-->
+
 There are additional components within an SM, but the ones listed above are the most important for understanding the performance optimizations we'll make throughout this article.
 
 In knowing this, you should immediately be aware that a CUDA kernel is not executing on "the GPU" operating as a monolithic processor like the CPU. Instead, work is distributed across all of the SMs within the GPU. 
@@ -35,71 +39,81 @@ Essentially, both are execution units that receive instructions and perform comp
 
 ## Load/Store Units 
 
-The Load/Store Units (LSUs) are the hardware components responsible for issuing memory operations that move data between registers and the memory hierarchy. 
+The Load/Store Units (LSUs) are the hardware components responsible for issuing memory operations that move data between registers and the memory hierarchy.
+Practically speaking, when CUDA code is compiled into SASS instructions through the nvcc compiler, there exists either a load or store instruction specifying the memory address involved and the registers used as the source or destination.
 
-Practically speaking, when CUDA code is compiled into SASS instructions, a load or store instruction specifies the memory address involved and the registers used as the source or destination. 
+For a **load instruction**, the LSU initiates a request to the memory hierarchy. The memory system first checks the L1 cache. If the data is found within the L1 cache (L1 cache hit), the data is returned to the requesting thread. If the data is not found in (L1 cache miss), the request proceeds to L2 cache. If the data is found in L2, it is retrieved and returned to the thread. If not, this implies that there are two cache misses, where the data must ultimately be fetched from the device memory.
 
-For a load, the LSU initiates a request to the memory hierarchy. The memory system first checks the appropriate cache levels, such as L1 and L2. If the data is found in L1, it is returned to the destination register. If there is an L1 cache miss but an L2 cache hit, the data is retrieved from L2 and returned to the register. If both caches miss, the data must ultimately be fetched from device memory (VRAM). 
+Since we are working with a consumer grade GPU, the device memory (VRAM) refers to GDDR7. In a data-center the GPUs such as the H100s’ (VRAM) is HBM.
 
-Since we are working with a consumer grade GPU, the device memory (VRAM) refers to GDDR7. ON data-center GPUs like the H100, the device memory (VRAM) is HBM.
+Now for a **store instruction**, the process is very similar to the load instruction. The LSU first initiates a request to write data from the register to the memory hierarchy. How the data is stored is dependent entirely on the cache policy thats associated with the store instruction. 
+
+For example, a write-back store instruction can cache data at multiple coherent cache level, but a cache-at-global-level store instruction will bypass the L1 and cache the data straight into the L2. Again, it all depends on the cache policy and the type of memory access performed by the store instruction. 
+
+We won't cover the details of cache operators here but if you want to understand how store instructions interact with the cache hierarchy, I recommend reading NVIDIA's Cache Operators for Memory Store Instructions section in the PTX ISA documentation[^6]. Its just beyond the scope of this blog. 
 
 ## Warp Schedulers
 
-The next big question following the introduction of Streaming Multiprocessor should be "how is work distributed across all of the SMs?". That job does not belong to the warp schedulers at all. It belongs to the **GigaThread Engine**, the block sitting next to the host interface in the die diagram above, and its whole job is to take the work you launched and hand it out to SMs that have room for it.
+Now a linger question you should have in the back of your head should be: "How does work actually get distributed across all of the SMs?". 
 
-The warp schedulers work one level down, after that handout has already happened. Each sub-partition owns one, and it decides, every cycle, which instruction that sub-partition issues next. We have not defined a warp yet, so we will come back to what these actually do once the execution model is on the table.
+This responsibility does not actually belong to the warp scheduler, instead it belongs to the **GigaThread Engine**. Its whole job is to take the work you launched with your kernel and hand it to an avaliable SMs. 
+
+Once a block is assigned to a SM by the GigaThread Engine, the threads within the block is divided into 32 threads groups called a warp.  At this point, know that the GigaThread engine determines which SM execuates a block, and the warp scheduler determines which warp executes an instruction next. 
+
+As stated earlier in this chapter, each SM contains 4 sub-partitions, and each sub-partition contains one **warp scheduler**. During each clock cycle, the warp scheduler selects an eligble warp and issues its next instructions to the execution units available to that sub-partition.   
+
+We will cover more detail when we introduce the CUDA execution model later.
 
 ## Memory Hierarchy
 
-The LSU walks a ladder of memories, and that ladder is the single most important thing to hold in your head for the rest of this article. Each level trades capacity for latency, and each one is visible to a different scope of the program:
+The GPU memory hierarchy is also a very important concept to understand when it comes to optimizations. As you move down the hierarchy, the capacity of memory and latency both increases. 
+
+At the highest level of the memory hierarchy, the registers are private to each thread which provides teh fasts look-up/storage. Shared memory is shared within a block which gives the programmer explicit control over frequently used data. L2 cache is shared across all SMs and is managed automatically by the hardware.The device memory is the largest memory but has the highest latency. 
 
 ![Every level down costs an order of magnitude more, the key is to stay higher memory region for as long as possible.](/images/gemm/memory-hierarchy.png)
 
-Registers are private to a single thread and are the only storage the execution units read operands from directly. They are also finite: the register file is a fixed budget — physically one per sub-partition, as we saw above — split across every thread resident on it, so a kernel that asks for more registers per thread gets fewer threads resident at once.
-
-Shared memory sits one step down. It is carved out of the same physical storage as L1 and it is private to a thread block, which makes it the one level the programmer manages by hand — you decide what goes in it and when. This is the level the entire optimization ladder is built around: if a value is going to be read many times by many threads, you want it in shared memory, read from device memory exactly once.
-
-L2 is shared by every SM on the die and is managed entirely by the hardware. You do not place data in it, but you can still influence your hit rate by controlling which blocks touch which addresses at roughly the same time.
-
-Device memory is the bottom of the ladder and the top of the capacity chart. It is where your matrices live when the kernel launches, it is an order of magnitude slower than anything above it, and every optimization in this article is ultimately an argument about how few times you can afford to touch it.
+The goal of optimizations is to keep data as high in the memory hierarchy as possible and aim for data resue before accessing the slower memory for the same data. 
 
 ## CUDA Programming Model
 
-That is the hardware half of the co-design. The other half is what you actually write.
+Everything discussed above is the CUDA hardware, the first half of the CUDA co-design. The second half is what you actually write, the CUDA Software.
 
-The CUDA programming model is the abstraction you write to harness the powerful GPU you have on hand. CUDA exposes a hierarchical model enabling CUDA practioners to express parallel execution through the division of grid, blocks, threads. 
+The CUDA programming model is the software abstraction you write to harness the powerful GPU you have on hand. CUDA Programming Model exposes a hierarchical model enabling CUDA practioners to express parallel execution through the division of grid, blocks, threads. 
 
 A grid is the complete collection of blocks. A block is a group of threads that execute and cooperate with one another. And a thread is the smallest unit of execution exposed by the CUDA programming model. Every thread in the grid runs the same kernel body, but each one runs it over its own piece of the data. 
 
 ![Zooming in one level at a time: the grid is every block, a block is a group of threads that share memory and can synchronize, and a thread is the smallest unit of execution.](/images/gemm/programming-model.png)
 
-Which raises the obvious question. If every thread is handed the same code, what actually makes thread 3 do something different from thread 4?
+Which raises the obvious question, if every thread is handed the same code, what makes a thread within a warp different from every other threads? 
 
-Its position, and nothing else. CUDA hands every thread four built-ins to read that position with. `threadIdx` and `blockIdx` tell a thread where it sits — which thread it is inside its block, and which block that is inside the grid. `blockDim` and `gridDim` tell it the shape of the two things it sits in.
-
-A thread turns that position into a piece of work with a single line of arithmetic:
-
-```cuda
-const int row = blockIdx.y * blockDim.y + threadIdx.y;
-```
-
-Identical source text in all of them, a different value in each. That one line is the entire mechanism, and it is easier to watch than to describe — so let's zoom in on a single block.
+The answer is the threads position. CUDA has 4 built-in apis built to determine the position of a thread. `threadIdx` and `blockIdx` tell a thread where it sits, which thread it is inside its block, and which block that is inside the grid. `blockDim` and `gridDim` tell it the shape of the two things it sits in. Each api also has 3 possible variables `x`, `y`, or  `z`. For the most part, writing CUDA kernels would take place within the 2-dimensional space therefore the `z` variable is rarely
+used. 
 
 ![Zooming in one more level. Every thread in the block issues the same instructions; the index it computes from those built-ins is the only thing that sends it to a different element of the data.](/images/gemm/inside-thread-block.png)
 
-The diagram draws eight threads because eight of them fit on a page, but a real block is hundreds. What matters is that every one of them is running the same instruction stream. There is no per-thread program. There is one kernel body, and the index each thread computes is the only thing that sends it somewhere different in memory. This is what people mean when they call CUDA an **SIMT** model: single instructions, multiple threads.
+```cuda
+const int row = blockIdx.y * blockDim.y + threadIdx.y;
+const int col = blockIdx.x * blockDim.x + threadIdx.x;
+```
 
-Look at what that buys you in the line we just wrote. `blockIdx.y * blockDim.y + threadIdx.y` is identical source text in every thread, but `threadIdx.y` holds a different value in each one, so every thread lands on its own `row`. You never write a loop over the rows. The loop is the launch itself, and if you want to cover twice as much of the matrix you launch twice as many threads without touching the kernel.
+The diagram above draws eight threads within because eight of them fit on a page, but a real block holds hunderds if not capping out at 1024 threads. What matters is that every one of them is running the same instruction. There is no per-thread program. There is one kernel body, and the unqiue index of a thread computes is the only thing that sends it somewhere different in memory. This is what people mean when they call CUDA an **SIMT** model: single instructions, multiple threads.
 
-The last line of the diagram is what makes a block worth having as a concept. Threads in the same block can hand data to each other through shared memory, and they can line up at a `__syncthreads()` barrier, where no thread moves past it until every thread in the block has reached it. Threads in two *different* blocks get neither. Our naive kernel will use neither, and every optimization from shared memory tiling onward is built on both — which is why the block, not the thread, ends up being the unit you do most of your thinking in.
+
+Understand that the threads in the same block can hand data to each other through shared memory, and they can line up at a `__syncthreads()` barrier, where no thread moves past it until every thread in the block has reached it. Threads in two *different* blocks do not share the same shared memory and cannot `__syncthreads()`. 
+
+In our first GEMM kernel, the naive kernel implementation will use neither, but every optimization moving forward, starting with shared memory tiling, is built on both ideas. The key insight is to recognize that the block, not the thread, ends up being the unit you do most of your thinking in, which ultimately dictates how you write your kernel.
 
 ## How the Program Maps to the Hardware
 
-Now that we have established what the GPU hardware does and what the CUDA software is, we next question to ask is which piece of the software abstraction (grid, blocks, threads) lands on which piece of silicon. 
+Now that we have established what the GPU hardware does and what the CUDA software is, the next question to ask is which piece of the software abstraction (grid, blocks, threads) lands on which piece of silicon. There are three of them, so let's take them one at a time.
 
-An SM can host multiple blocks at the same time. The amount of blocks that's resident on the SM is not a number you choose. Now, a block can hold at most 1024 threads at a time, and each Block is assigned to exactly one SM and it stays resident until every thread has finished its execution. During execution, the threads within the block can write to the on-chip shared memory. Each thread within a block can also write to a register within the register file as well. 
+The **grid** maps to the whole GPU. Every SM on the die is fair game, and the GigaThread Engine is what hands the grid's blocks out to them.
 
-What the mapping does not yet explain is what an SM does with a block once it has one. It does not run 1024 threads independently. It divides the block into **warps**.
+The **block** maps to exactly one SM. It is assigned there, it stays resident until every one of its threads has finished, and it never migrates and never splits across two SMs. That single fact is what makes the cooperation we talked about in the programming model physically possible. The shared memory a block writes to is storage sitting on the SM it landed on, and the `__syncthreads()` barrier its threads line up at is hardware inside that same SM. Two blocks on two different SMs have neither, which is exactly why CUDA does not let them cooperate.
+
+An SM can host several blocks at once, and how many is not a number you choose. It falls out of what each block asks for. Registers per thread come out of that SM's register file, shared memory per block comes out of that SM's shared memory, and no block may exceed 1024 threads. Ask for more of any one of them and fewer blocks fit. This is the ratio we will later measure as occupancy, and it is why an optimization that looks free on paper can lose you performance by quietly inflating register usage.
+
+Which leaves the **thread**, and this is where the mapping runs out. There is no piece of silicon that the thread lands on the way a block lands on an SM. The SM does not take your 1024 threads and run them as 1024 independent things. It cuts the block into **warps**, and the warp is what it actually schedules.
 
 ## CUDA Execution Model
 
@@ -138,5 +152,5 @@ This section of the article covers the most bare-bones aspects of CUDA programmi
 [^3]: [Programming Massively Parallel Processors: A Hands-on Approach (5th Edition)](https://www.amazon.com/dp/0443439001)
 [^4]: [Understanding Latency Hiding on GPUs](https://www2.eecs.berkeley.edu/Pubs/TechRpts/2016/Archive/EECS-2016-143.pdf)
 [^5]: [What happens when you run a CUDA kernel](https://fergusfinn.com/blog/what-happens-when-you-run-a-gpu-kernel/#an-interposition-hook)
-
+[^6]: [NVIDIA's PTX ISA documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=Cache#cache-operators)
 
