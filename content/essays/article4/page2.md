@@ -11,7 +11,9 @@ In a modern NVIDIA GPU, the most important hardware components to understand for
 
 ![The GB203 die behind the RTX 5080: 7 GPCs, 42 TPCs, 84 SMs, a 64 MB unified L2 shared by every GPC, and eight 32-bit GDDR7 controllers.](/images/gemm/rtx-5080-die.png)
 
-The exact organization of these components varies across NVIDIA GPU architectures, but the fundamental concepts remain consistent across modern NVIDIA GPUs. Throughout this article, we will use the **Blackwell architecture**, specifically the consumer-grade **GeForce RTX 5080**, as our reference point.[^3]
+The exact organization of these components varies across NVIDIA GPU architectures, but the fundamental concepts remain consistent across modern NVIDIA GPUs. Throughout this article, we will use the **Blackwell architecture**, specifically the consumer-grade **GeForce RTX 5080**, as our reference point.[^2]
+
+> Everything under the hardware section is throughly covered in *Programming Massively Parallel Processors*, basically chapters 1 through 4 of that book.[^3]
 
 ## Streaming Multiprocessor
 The **Streaming Multiprocessor (SM)** is the most important piece of hardware to understand. You can think of an SM as a small, self-contained compute unit within the GPU: it contains the hardware responsible for scheduling and executing threads.
@@ -125,14 +127,16 @@ The scale is what makes this work at all. A load that misses every cache and goe
 
 And switching between them is free, which is the part worth sitting with. A CPU context switch has to save and restore registers, so it costs real time. A GPU never does that, because every resident warp already owns its registers in the register file for as long as it lives on the SM. The scheduler picks a different warp and issues on the next cycle. That is why the register file is so enormous, and it is also why asking for too many registers per thread hurts you — it does not make any individual thread slower, it means fewer warps fit on the SM, and warps are the only mechanism you have for covering memory latency.
 
-This is what occupancy, which we met a moment ago, is actually measuring: how many warps are resident on an SM relative to the maximum it could hold. Note what that does and does not tell you. It is the *capacity* to hide latency, not proof that you are hiding any — which is why chasing occupancy on its own is not the same thing as chasing performance. We will run into that distinction directly once register pressure starts costing us residency.
+This is what occupancy, which we met a moment ago, is actually measuring: how many warps are resident on an SM relative to the maximum it could hold. Note what that does and does not tell you. It is the *capacity* to hide latency, not proof that you are hiding any — which is why chasing occupancy on its own is not the same thing as chasing performance.[^4] We will run into that distinction directly once register pressure starts costing us residency.
 
 Nearly every optimization in this article follows from the warp. Coalescing is about what one warp's 32 addresses look like to the memory system, bank conflicts are about what they look like to shared memory, and tiling is about giving each warp enough arithmetic to chew on while other warps wait.
 
-This section of the article covers the most bare-bones aspects of CUDA programming and CUDA hardware architecture. It should be just enough to get us started with writing the actual naive kernel. However, if you want to dive deeper into what happens when you run a CUDA kernel, check out Fergus Finn's blog. [^2]
+This section of the article covers the most bare-bones aspects of CUDA programming and CUDA hardware architecture. It should be just enough to get us started with writing the actual naive kernel. However, if you want to dive deeper into what happens when you run a CUDA kernel, check out Fergus Finn's blog.[^5]
 
 [^1]: [How CUDA Programming Works - Stephen Jones, CUDA Architect](https://www.youtube.com/watch?v=QQceTDjA4f4&t=75s)
-[^2]: [What happens when you run a CUDA kernel](https://fergusfinn.com/blog/what-happens-when-you-run-a-gpu-kernel/#an-interposition-hook)
-[^3]: [NVIDIA RTX BLACKWELL GPU ARCHITECTURE](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf?utm_source=chatgpt.com)
+[^2]: [NVIDIA RTX Blackwell GPU Architecture](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf)
+[^3]: [Programming Massively Parallel Processors: A Hands-on Approach (5th Edition)](https://www.amazon.com/dp/0443439001)
+[^4]: [Understanding Latency Hiding on GPUs](https://www2.eecs.berkeley.edu/Pubs/TechRpts/2016/Archive/EECS-2016-143.pdf)
+[^5]: [What happens when you run a CUDA kernel](https://fergusfinn.com/blog/what-happens-when-you-run-a-gpu-kernel/#an-interposition-hook)
 
 
