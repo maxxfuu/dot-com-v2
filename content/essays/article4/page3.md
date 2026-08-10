@@ -55,7 +55,7 @@ dim3 blockDim(BLOCKSIZE, BLOCKSIZE);
 sgemm_naive<BLOCKSIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 ```
 
-Two details in there matter more than they look. The `CEIL_DIV` exists because the matrix dimensions are not required to be multiples of the block size, so we round the grid up and let the last blocks hang over the edge — which is what the `if (row < M && col < N)` guard inside the kernel is cleaning up. At `M = N = K = 4096` with `BLOCKSIZE = 32` the division is exact, but writing the kernel as though it isn't costs one comparison and saves you from a class of bug that only appears on someone else's matrix.
+Two details in there matter more than they look. The `CEIL_DIV` exists because the matrix dimensions are not required to be multiples of the block size, so we round the grid up and let the last blocks hang over the edge - which is what the `if (row < M && col < N)` guard inside the kernel is cleaning up. At `M = N = K = 4096` with `BLOCKSIZE = 32` the division is exact, but writing the kernel as though it isn't costs one comparison and saves you from a class of bug that only appears on someone else's matrix.
 
 The second detail is the bound this kernel is actually working against. Every thread reads an entire row of A and an entire column of B out of global memory to produce one output value: `2*M*N*K` FLOPs against `2*M*N*K` loaded floats. That is roughly one FLOP per byte moved, and a 5080 can move nowhere near enough bytes per second to keep its arithmetic units busy at that ratio. The kernel is memory bound before it has executed a single instruction, and 460 GFLOP/s against cuBLAS's 38,216 is what that looks like in practice.
 
@@ -66,7 +66,7 @@ The programming model says thread blocks must be able to run in any order, yet t
 ---
 Because the block is the unit the hardware assigns to a single SM. Threads in one block are resident on the same SM at the same time, so they have a shared memory and a barrier to coordinate through. Two different blocks may be on different SMs, or may not even be resident simultaneously, so no such mechanism can exist between them.
 
-That restriction is what makes a kernel portable across GPUs. Since blocks are independent, the runtime is free to schedule as many concurrently as the device has room for — 84 SMs' worth or 16 SMs' worth — without the kernel being written any differently.
+That restriction is what makes a kernel portable across GPUs. Since blocks are independent, the runtime is free to schedule as many concurrently as the device has room for - 84 SMs' worth or 16 SMs' worth - without the kernel being written any differently.
 :::
 
 ```cuda
