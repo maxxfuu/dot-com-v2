@@ -1,1 +1,1 @@
-## Padded Shared Memory: Eliminating Bank Conflicts
+## Warp Tiling: A Third Level of Tiling

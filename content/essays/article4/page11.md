@@ -1,1 +1,1 @@
-## Double Buffering: Software Pipelining the K-Loop
+## Padded Shared Memory: Eliminating Bank Conflicts

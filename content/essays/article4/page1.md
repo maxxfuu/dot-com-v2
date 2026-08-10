@@ -12,14 +12,16 @@ In this article, I will walk you through how to write a CUDA matrix multiplicati
 
 ![Every kernel in this article, benchmarked on an RTX 5080 at M=N=K=4096.](/images/gemm/kernel-benchmark.png)
 
-Learning CUDA has been an incredible and exciting journey. While learning CUDA has be easier within the past few years, most of the resources remain difficult to digest. My intended audience for this article is to teach someone that knows *absolutely nothing* about CUDA and GPU optimization and bring them up to speed on writing a performant kernel from scratch.
+Learning CUDA has been an incredible and exciting journey. While learning CUDA has become easier over the past few years, most resources remain difficult to digest. Matrix multiplication is the single most important operation within modern deep learning, therefore there is no better to learn about CUDA than to create something useful. 
 
-While learning how to optimize a SGEMM kernel myself, I've noticed the majority of optimization comes from understanding the GPU memory hierachy at the most fundamental level and learning how to feed computation units correctly. I've previously thought that writing performant CUDA kernels was about coming up with most very clever algorithms to squeeze out all of the performance of a GPU, I was wrong. 
+The intended audience for this article is someone who knows *absolutely nothing* about CUDA or GPU optimization. My goal is to bring them up to speed and teach them how to write a performant CUDA kernel from scratch.
 
-Its all about the memory hierachy and the movement of data with the CUDA software. The idea is simple, but the execution can be difficult. We will iteratively walk through the hardware components of a CUDA architecture all the way to optimizing a CUDA kernel. Below is the table of contents, feel free to skip to skip around although reading this sequentially is advised. 
+I've previously thought that writing performant CUDA kernels was about coming up with most very clever algorithms to squeeze out all of the performance of a GPU. I was wrong. While learning how to optimize a SGEMM kernel myself, I've noticed the majority of optimization comes from understanding the GPU memory hierachy at the most fundamental level and learning how to feed data into computation units correctly.
+
+Its all about the memory hierachy and the movement of data with the CUDA software. The idea is simple, but the execution can be difficult. We will iteratively walk through the hardware components of a CUDA architecture all the way to optimizing a CUDA kernel. Below is the table of contents, feel free to skip around although reading this sequentially is advised. 
 
 ### To write a CUDA Matmul Kernel That Reaches 90% of cuBLAS Performance
-1. [From CUDA Kernels to NVIDIAs GPU Hardware Architecture](/essays/article4/page2)
+1. [From CUDA Hardware Architecture to CUDA Kernels](/essays/article4/page2)
 2. [The Naive Kernel: Establishing a Baseline](/essays/article4/page3)
 3. [Global Memory Coalescing](/essays/article4/page4)
 4. [Flattening the Block](/essays/article4/page5)
@@ -27,16 +29,16 @@ Its all about the memory hierachy and the movement of data with the CUDA softwar
 6. [1D Register Tiling: One Thread, TM Outputs](/essays/article4/page7)
 7. [2D Register Tiling: The Outer Product](/essays/article4/page8)
 8. [Vectorized Memory Access: 128-bit Loads and Stores](/essays/article4/page9)
-9. [Padded Shared Memory: Eliminating Bank Conflicts](/essays/article4/page10)
-10. [Double Buffering: Software Pipelining the K-Loop](/essays/article4/page11)
-11. [Warp Tiling: A Third Level of Tiling](/essays/article4/page12)
+9. [Warp Tiling: A Third Level of Tiling](/essays/article4/page10)
+10. [Padded Shared Memory: Eliminating Bank Conflicts](/essays/article4/page11)
+11. [Double Buffering: Software Pipelining the K-Loop](/essays/article4/page12)
 12. [Autotuning: Searching the Tile-Shape Space](/essays/article4/page13)
 
 
-This writing was inspired by blogs such as Simons writing on this exact topic[^1]. Abhik's[^2] and Robert's[^3] on this topic is what cement these concepts for me. The reset of my knowledge gap was filed with reading PMPP [^4] and Modals' GPU Glossary[^5] and a lot of tokens.
+This writing was inspired by blogs such as Simons writing on this exact topic[^1]. Abhik's[^2] and Robert's[^3] on this topic is what cemented these concepts for me. The reset of my knowledge gap was filed with reading PMPP [^4], Modals' GPU Glossary[^5], and a lot of tokens.
 
 [^1]: [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog](https://siboehm.com/articles/22/CUDA-MMM)
 [^2]: [CUDA Matrix Multiplication Optimization: From Naive to Near-cuBLAS](https://abhik.ai/articles/cuda-matrix-multiplication-optimization)
 [^3]: [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance](https://robertzhang.me/blog/cuda-mmm)
 [^4]: [Programming Massively Parallel Processors: A Hands-on Approach (5th Edition)](https://www.amazon.com/dp/0443439001)
-[^5]: [Modal, GPU Glossary](https://modal.com/gpu-glossary)
+[^5]: [GPU Glossary](https://modal.com/gpu-glossary)

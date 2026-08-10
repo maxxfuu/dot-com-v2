@@ -1,1 +1,1 @@
-## Warp Tiling: A Third Level of Tiling
+## Double Buffering: Software Pipelining the K-Loop

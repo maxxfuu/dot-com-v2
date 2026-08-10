@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Fragment } from "react";
 import Link from "next/link";
 import { CheckUnderstanding } from "@/app/(essays)/essays/components/check-understanding";
+import { ZoomableImage } from "@/components/zoomable-image";
 import { getHighlighter, highlightCode } from "@/lib/highlight";
 
 const referenceAccentColor = "#036FFF";
@@ -299,7 +300,11 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       continue;
     }
 
-    const mediaMatch = line.trim().match(/^!\[([^\]]*)\]\(([^)\s]+)\)$/);
+    // Trailing markdown title (![alt](/src "title")) is accepted and ignored,
+    // so a stray title never silently downgrades a figure to paragraph text.
+    const mediaMatch = line
+      .trim()
+      .match(/^!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)$/);
 
     if (mediaMatch) {
       const [, caption, src] = mediaMatch;
@@ -314,15 +319,10 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
               loop
               muted
               playsInline
-              className="w-full rounded-md border border-border"
+              className="w-full rounded-md"
             />
           ) : (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={src}
-              alt={caption}
-              className="w-full rounded-md border border-border"
-            />
+            <ZoomableImage src={src} alt={caption} className="w-full rounded-md" />
           )}
           {caption ? (
             <figcaption className="mt-3 text-center font-sans text-xs text-muted-foreground">
