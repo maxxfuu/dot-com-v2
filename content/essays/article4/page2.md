@@ -39,8 +39,6 @@ Practically speaking, when CUDA code is compiled into SASS instructions, a load 
 
 For a load, the LSU initiates a request to the memory hierarchy. The memory system first checks the appropriate cache levels, such as L1 and L2. If the data is found in L1, it is returned to the destination register. If there is an L1 cache miss but an L2 cache hit, the data is retrieved from L2 and returned to the register. If both caches miss, the data must ultimately be fetched from device memory (VRAM). 
 
-[Insert Image Here]
-
 Since we are working with a consumer grade GPU, the device memory (VRAM) refers to GDDR7. ON data-center GPUs like the H100, the device memory (VRAM) is HBM.
 
 ## Warp Schedulers
@@ -87,7 +85,7 @@ Identical source text in all of them, a different value in each. That one line i
 
 ![Zooming in one more level. Every thread in the block issues the same instructions; the index it computes from those built-ins is the only thing that sends it to a different element of the data.](/images/gemm/inside-thread-block.png)
 
-The diagram draws eight threads because eight of them fit on a page, but a real block is hundreds. What matters is that every one of them is running the same instruction stream. There is no per-thread program. There is one kernel body, and the index each thread computes is the only thing that sends it somewhere different in memory. This is what people mean when they call CUDA an **SPMD** model: single program, multiple data.
+The diagram draws eight threads because eight of them fit on a page, but a real block is hundreds. What matters is that every one of them is running the same instruction stream. There is no per-thread program. There is one kernel body, and the index each thread computes is the only thing that sends it somewhere different in memory. This is what people mean when they call CUDA an **SIMT** model: single instructions, multiple threads.
 
 Look at what that buys you in the line we just wrote. `blockIdx.y * blockDim.y + threadIdx.y` is identical source text in every thread, but `threadIdx.y` holds a different value in each one, so every thread lands on its own `row`. You never write a loop over the rows. The loop is the launch itself, and if you want to cover twice as much of the matrix you launch twice as many threads without touching the kernel.
 
