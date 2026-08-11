@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Fragment } from "react";
 import Link from "next/link";
+import katex from "katex";
 import { CheckUnderstanding } from "@/app/(essays)/essays/components/check-understanding";
 import { ZoomableImage } from "@/components/zoomable-image";
 import { getHighlighter, highlightCode } from "@/lib/highlight";
@@ -99,6 +100,41 @@ function renderInlineMarkdown(text: string) {
 
 const orderedItemPattern = /^(\d+)\.\s+/;
 
+// Figure sizes for the whole blog, named here and chosen per image in markdown:
+//   ![caption](/src "small")    square or portrait diagrams
+//   ![caption](/src)            medium, the default
+//   ![caption](/src "large")
+//   ![caption](/src "full")     the full reading column
+// Both caps apply, so the tighter one wins and aspect ratio is preserved.
+// w-auto everywhere except "full", so an image is never stretched past its own
+// pixels unless the author explicitly asks for the whole column.
+const figureSizes = {
+  small: "w-auto max-h-[16rem] max-w-[50%]",
+  medium: "w-auto max-h-[24rem] max-w-[80%]",
+  large: "w-auto max-h-[32rem] max-w-[95%]",
+  full: "w-full max-h-none max-w-full",
+} as const;
+
+// ```latex fences are typeset as display math rather than shown as code.
+const mathLanguages = new Set(["latex", "tex", "math"]);
+
+function renderMath(source: string) {
+  return katex.renderToString(source.trim(), {
+    displayMode: true,
+    // Render the error inline instead of failing the whole page build.
+    throwOnError: false,
+    strict: false,
+  });
+}
+
+function figureSizeClass(option: string | undefined) {
+  const key = option?.trim().toLowerCase() ?? "";
+
+  return key in figureSizes
+    ? figureSizes[key as keyof typeof figureSizes]
+    : figureSizes.medium;
+}
+
 function normalizeHeading(text: string) {
   return text.trim().toLowerCase();
 }
@@ -161,6 +197,20 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       }
 
       const code = codeLines.join("\n");
+
+      if (mathLanguages.has(language.toLowerCase())) {
+        elements.push(
+          <div
+            key={`math-${index}`}
+            className="my-8 overflow-x-auto overflow-y-hidden py-1 text-center"
+            dangerouslySetInnerHTML={{ __html: renderMath(code) }}
+          />
+        );
+
+        index += 1;
+        continue;
+      }
+
       const highlighted = highlightCode(highlighter, code, language);
 
       elements.push(
@@ -168,11 +218,7 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
           key={`code-${index}`}
           className="my-10 border border-neutral-300 px-5 py-4 dark:border-neutral-700"
         >
-          {language ? (
-            <div className="mb-3 font-sans text-[0.625rem] uppercase tracking-[0.2em] text-muted-foreground">
-              {language}
-            </div>
-          ) : null}
+          {/* The fence language selects the grammar only; it is never shown. */}
           {highlighted ? (
             <div
               className="code-block overflow-x-auto font-mono text-sm leading-relaxed"
@@ -313,13 +359,16 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
 
     // Trailing markdown title (![alt](/src "title")) is accepted and ignored,
     // so a stray title never silently downgrades a figure to paragraph text.
+    // Greedy alt so brackets inside a caption (t[0][0], data[i]) don't end the
+    // match early and silently downgrade the figure to paragraph text.
     const mediaMatch = line
       .trim()
-      .match(/^!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)$/);
+      .match(/^!\[(.*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)$/);
 
     if (mediaMatch) {
-      const [, caption, src] = mediaMatch;
+      const [, caption, src, sizeOption] = mediaMatch;
       const isVideo = /\.(mp4|webm|mov)$/i.test(src);
+      const mediaClassName = `mx-auto block rounded-md ${figureSizeClass(sizeOption)}`;
 
       elements.push(
         <figure key={`media-${index}`} className="my-10">
@@ -330,10 +379,10 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
               loop
               muted
               playsInline
-              className="w-full rounded-md"
+              className={mediaClassName}
             />
           ) : (
-            <ZoomableImage src={src} alt={caption} className="w-full rounded-md" />
+            <ZoomableImage src={src} alt={caption} className={mediaClassName} />
           )}
           {caption ? (
             <figcaption className="mt-3 text-center font-sans text-xs text-muted-foreground">

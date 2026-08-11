@@ -1,30 +1,35 @@
 ## The Naive Kernel: Establishing a Baseline
 
-### Mapping the Programming Model onto GEMM
+### What is GEMM 
 
-For GEMM, we can think of each thread as being responsible for computing some portion of the output matrix C.
+Before we begin, let's establish what a General Matrix Multiplication (GEMM) is so that we understand what's going on behind the scenes with every kernel implementation. Every kernel in this article computes the exact same thing; an output matrix C computed by matrices A and B. The **GEMM** follow the same mathematical formula listed below:
 
-For example:
+Note that variables alpha and beta are just scalar coefficients that scale the matrix multiplication and the existing output matrix C. 
 
-```
-              Matrix C
-
-       ┌────┬────┬────┬────┐
-       │ T0 │ T1 │ T2 │ T3 │
-       ├────┼────┼────┼────┤
-       │ T4 │ T5 │ T6 │ T7 │
-       ├────┼────┼────┼────┤
-       │... │... │... │... │
-       └────┴────┴────┴────┘
+``` latex
+C \leftarrow \alpha A B + \beta C
 ```
 
-A naive GEMM might assign one thread to one output element:
+**A is (M x K)**, **B is (K x N)**, and **C is (M x N)**. All three of these matrices are stored in row-major order in memory. Each optimized kernel thats introduced within the article will use the following dimensions: **M = N = K = 4096**, **alpha = 1**, **beta = 0**. 
 
-```
-C[row][col] = dot(A[row], B[col]);
+This ensures that very kernel performs the same 2 * M * N * K floating point operations, which is roughly 137 billion operation in total, against the same three matrices.
+
+### Naive Implementation
+
+For the first kernel, we are really just trying to express GEMM in CUDA. We'll start off by using the grid, block, and thread to assign one thread to each output cell in the output matrix C. Start by expressing each thread with its respective global thread indicies: 
+
+![Each thread computes one element of C. Thread t[0][0] owns the top-left corner, and moving one thread over or one thread down moves you exactly one column or row over in the output.](/images/gemm/matrix-c-indexing.png)
+
+``` cuda 
+const int BLOCKSIZE = 32;
+
+const int row = blockIdx.x * BLOCKSIZE + threadIdx.x;
+const int col = blockIdx.y * BLOCKSIZE + threadIdx.y;
 ```
 
-This gives us a simple programming abstraction: many threads independently compute many elements of C in parallel. Nothing is shared, nothing is coordinated, and every thread walks the full K dimension by itself. Written out against our actual signature, the entire kernel is this:
+Given this mapping, a single thread computes the dot product between a row of A and a columns of B, then writes the product into its corresponding output cell in C. 
+
+Therefore, we need to write the function for a single thread as everything will be executed in parallel within a warp. For each thread that writes to its own output cell in matrix C, the thread will walk the full K dimension between its corresponding row and column. Written out against our actual function signature, the entire kernel looks like this:
 
 ```cuda
 template <const int BLOCKSIZE>
@@ -43,9 +48,13 @@ __global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A,
 }
 ```
 
-The launch side decides how that index space is carved up. We want one thread per element of C, so we ask for `32x32` threads per block and enough blocks to cover the matrix:
+To visualize this naive kernel:
 
-```cuda
+![Two neighbouring threads and the memory each one touches. Both walk the full K dimension, thread 0 reading row 0 of A against column 0 of B, thread 1 reading row 1 against the same column, to produce one element of C each.](/images/gemm/naive-access-pattern.png "large")
+
+To launch this kernel, we map `blockIdx.x` and `threadIdx.x` to col and `blockIdx.y` and `threadIdx.y` to row, so the `gridDim.x` walks along the `N` dimension and `gridDim.y` walks along the `M` dimension. For M = N = 4096 with BLOCKSIZE = 32, that's gridDim = (128, 128, 1) and blockDim = (32, 32, 1), or 16,384 blocks of 1024 threads each, one thread per output element.
+
+``` cuda 
 const int BLOCKSIZE = 32;
 
 // one threadblock per 32x32 tile of C; grid.x walks N, grid.y walks M
@@ -55,32 +64,11 @@ dim3 blockDim(BLOCKSIZE, BLOCKSIZE);
 sgemm_naive<BLOCKSIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 ```
 
-Two details in there matter more than they look. The `CEIL_DIV` exists because the matrix dimensions are not required to be multiples of the block size, so we round the grid up and let the last blocks hang over the edge - which is what the `if (row < M && col < N)` guard inside the kernel is cleaning up. At `M = N = K = 4096` with `BLOCKSIZE = 32` the division is exact, but writing the kernel as though it isn't costs one comparison and saves you from a class of bug that only appears on someone else's matrix.
+Three details worth noticing. 
 
-The second detail is the bound this kernel is actually working against. Every thread reads an entire row of A and an entire column of B out of global memory to produce one output value: `2*M*N*K` FLOPs against `2*M*N*K` loaded floats. That is roughly one FLOP per byte moved, and a 5080 can move nowhere near enough bytes per second to keep its arithmetic units busy at that ratio. The kernel is memory bound before it has executed a single instruction, and 460 GFLOP/s against cuBLAS's 38,216 is what that looks like in practice.
+Firstly, the CUDA hardware linearizes the threads in a block when forming warps. Even though we define the block with dimensions `x` and `y`, the CUDA hardware flattens everything into a single linear index. Therefore the `x` dimension is the fastest-changing dimension within the thread block. This matters because it dictates how each cell is accessed within the C matrix. In this case we will walk down column 0, such that the row value is the one incrementing: `c[0][0]`, `c[1][0]`, `c[n][0]`.
 
-Every optimization in the rest of this article is an attack on that one ratio.
+Secondly, the `CEIL_DIV` represents ceiling division, exists because the matrix dimensions are not required to be multiples of the block size, so we round the grid up and let the last blocks hang over the "edge". This is also why we have to have the boundary check in place; the `if (row < M && col < N)` guard inside the kernel prevents out-of-bounds threads from accessing garbage memory. In our kernel implementation, `M = N = K = 4096` with `BLOCKSIZE = 32` makes the division exact, but writing the kernel as though it isn't costs one comparison and further prevents bugs related to boundedness.
 
-:::check
-The programming model says thread blocks must be able to run in any order, yet threads inside a block may cooperate freely. Why does CUDA draw the line there?
----
-Because the block is the unit the hardware assigns to a single SM. Threads in one block are resident on the same SM at the same time, so they have a shared memory and a barrier to coordinate through. Two different blocks may be on different SMs, or may not even be resident simultaneously, so no such mechanism can exist between them.
+Lastly, every thread reads an entire row of A and an entire column of B out of global memory to produce one output value. That is `2*M*N*K` FLOPs against `2*M*N*K` loaded floats. That is roughly one FLOP per float loaded, or, since each float is 4 bytes, about 0.25 FLOP per byte moved, and a 5080 can move nowhere near enough bytes per second to keep its arithmetic units busy at that ratio. The kernel is memory bound before it has executed a single instruction, and 460 GFLOP/s against cuBLAS's 38,216 is what that looks like in practice. 
 
-That restriction is what makes a kernel portable across GPUs. Since blocks are independent, the runtime is free to schedule as many concurrently as the device has room for - 84 SMs' worth or 16 SMs' worth - without the kernel being written any differently.
-:::
-
-```cuda
-template <const int BLOCKSIZE>
-__global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
-  const int row = blockIdx.y * BLOCKSIZE + threadIdx.x;
-  const int col = blockIdx.x * BLOCKSIZE + threadIdx.y;
-
-  if (row < M && col < N) {
-    float temp = 0.0f;
-    for (int i = 0; i < K; ++i) {
-      temp += A[row * K + i] * B[i * N + col];
-    }
-    C[row * N + col] = alpha * temp + beta * C[row * N + col];
-  }
-}
-```

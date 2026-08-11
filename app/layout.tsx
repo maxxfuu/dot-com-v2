@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist_Mono, Figtree, Newsreader } from "next/font/google";
 import "./globals.css";
+import "katex/dist/katex.min.css";
 import { ContentRefresh } from "@/components/content-refresh";
 import { SiteFooter } from "@/components/site-footer";
 import { SiteHeader } from "@/components/site-header";

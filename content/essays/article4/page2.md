@@ -76,18 +76,19 @@ The goal of optimizations is to keep data as high in the memory hierarchy as pos
 
 ## CUDA Programming Model
 
-Everything discussed above is the CUDA hardware, the first half of the CUDA co-design. The second half is what you actually write, the CUDA Software.
+Everything discussed above is around the CUDA hardware, the first half of the CUDA co-design. The second half of the CUDA co-design is what you actually write, the CUDA software.
 
-The CUDA programming model is the software abstraction you write to harness the powerful GPU you have on hand. CUDA Programming Model exposes a hierarchical model enabling CUDA practioners to express parallel execution through the division of grid, blocks, threads. 
+The CUDA programming model is the software abstraction you write to harness the powerful GPU you have on hand. The CUDA Programming Model exposes a hierarchical model enabling CUDA practioners to express parallel execution through the division of grid, blocks, threads. 
 
-A grid is the complete collection of blocks. A block is a group of threads that execute and cooperate with one another. And a thread is the smallest unit of execution exposed by the CUDA programming model. Every thread in the grid runs the same kernel body, but each one runs it over its own piece of the data. 
+A grid is the complete collection of blocks. A block is a group of threads that execute and can cooperate with one another. And a thread is the smallest unit of execution exposed by the CUDA programming model. Every thread within a block executes the same instruction but just with different data. 
 
 ![Zooming in one level at a time: the grid is every block, a block is a group of threads that share memory and can synchronize, and a thread is the smallest unit of execution.](/images/gemm/programming-model.png)
 
-Which raises the obvious question, if every thread is handed the same code, what makes a thread within a warp different from every other threads? 
+Now, if every thread is executes the same instruction, what makes a thread within a warp different from every other threads? 
 
-The answer is the threads position. CUDA has 4 built-in apis built to determine the position of a thread. `threadIdx` and `blockIdx` tell a thread where it sits, which thread it is inside its block, and which block that is inside the grid. `blockDim` and `gridDim` tell it the shape of the two things it sits in. Each api also has 3 possible variables `x`, `y`, or  `z`. For the most part, writing CUDA kernels would take place within the 2-dimensional space therefore the `z` variable is rarely
-used. 
+The answer is the threads position. CUDA has 4 built-in APIs that helps determine the position of a thread. Each API also has 3 possible variables `x`, `y`, or  `z` which determines the dimension direction. Writing CUDA kernels within the context of deep learning generally takes place around the `x` and `y` plane, within the 2-dimensional therefore the `z` variable is rarely used. 
+
+The `threadIdx` and `blockIdx` determines where a thread sits within its block and the block's position within the grid. `blockDim` and `gridDim` determines the shape of the block or grid, respectively.
 
 ![Zooming in one more level. Every thread in the block issues the same instructions; the index it computes from those built-ins is the only thing that sends it to a different element of the data.](/images/gemm/inside-thread-block.png)
 
@@ -96,24 +97,11 @@ const int row = blockIdx.y * blockDim.y + threadIdx.y;
 const int col = blockIdx.x * blockDim.x + threadIdx.x;
 ```
 
-The diagram above draws eight threads within because eight of them fit on a page, but a real block holds hunderds if not capping out at 1024 threads. What matters is that every one of them is running the same instruction. There is no per-thread program. There is one kernel body, and the unqiue index of a thread computes is the only thing that sends it somewhere different in memory. This is what people mean when they call CUDA an **SIMT** model: single instructions, multiple threads.
+The diagram above has eight threads shown because that's all I could reasonably fit on a page, but a real block can hold upwards of **1024 threads**. What matters is that every thread executes the same instructions. There is no separate program for each thread; there is one kernel body, and each thread's unqiue index determines which data it accesses. This is what people mean when they call CUDA an **SIMT** model: single instructions, multiple threads.
 
-
-Understand that the threads in the same block can hand data to each other through shared memory, and they can line up at a `__syncthreads()` barrier, where no thread moves past it until every thread in the block has reached it. Threads in two *different* blocks do not share the same shared memory and cannot `__syncthreads()`. 
+Also understand that the threads in the same block can hand data to each other through shared memory and they can line up at a `__syncthreads()` barrier, where no thread moves past it until every thread in the block has reached it. Note that this only applies to threads that share the same block. Note that threads in two *different* blocks do not share the same shared memory and cannot `__syncthreads()`. This isn't a software restriction CUDA is choosing to enforce - it's physical. A block is assigned to exactly one SM and stays resident there until every one of its threads finishes, so the shared memory it writes to and the barrier it synchronizes on are both hardware sitting on that specific SM. A block on a different SM has no way to reach either one.
 
 In our first GEMM kernel, the naive kernel implementation will use neither, but every optimization moving forward, starting with shared memory tiling, is built on both ideas. The key insight is to recognize that the block, not the thread, ends up being the unit you do most of your thinking in, which ultimately dictates how you write your kernel.
-
-## How the Program Maps to the Hardware
-
-Now that we have established what the GPU hardware does and what the CUDA software is, the next question to ask is which piece of the software abstraction (grid, blocks, threads) lands on which piece of silicon. There are three of them, so let's take them one at a time.
-
-The **grid** maps to the whole GPU. Every SM on the die is fair game, and the GigaThread Engine is what hands the grid's blocks out to them.
-
-The **block** maps to exactly one SM. It is assigned there, it stays resident until every one of its threads has finished, and it never migrates and never splits across two SMs. That single fact is what makes the cooperation we talked about in the programming model physically possible. The shared memory a block writes to is storage sitting on the SM it landed on, and the `__syncthreads()` barrier its threads line up at is hardware inside that same SM. Two blocks on two different SMs have neither, which is exactly why CUDA does not let them cooperate.
-
-An SM can host several blocks at once, and how many is not a number you choose. It falls out of what each block asks for. Registers per thread come out of that SM's register file, shared memory per block comes out of that SM's shared memory, and no block may exceed 1024 threads. Ask for more of any one of them and fewer blocks fit. This is the ratio we will later measure as occupancy, and it is why an optimization that looks free on paper can lose you performance by quietly inflating register usage.
-
-Which leaves the **thread**, and this is where the mapping runs out. There is no piece of silicon that the thread lands on the way a block lands on an SM. The SM does not take your 1024 threads and run them as 1024 independent things. It cuts the block into **warps**, and the warp is what it actually schedules.
 
 ## CUDA Execution Model
 
@@ -141,7 +129,7 @@ The scale is what makes this work at all. A load that misses every cache and goe
 
 And switching between them is free, which is the part worth sitting with. A CPU context switch has to save and restore registers, so it costs real time. A GPU never does that, because every resident warp already owns its registers in the register file for as long as it lives on the SM. The scheduler picks a different warp and issues on the next cycle. That is why the register file is so enormous, and it is also why asking for too many registers per thread hurts you - it does not make any individual thread slower, it means fewer warps fit on the SM, and warps are the only mechanism you have for covering memory latency.
 
-This is what occupancy, which we met a moment ago, is actually measuring: how many warps are resident on an SM relative to the maximum it could hold. Note what that does and does not tell you. It is the *capacity* to hide latency, not proof that you are hiding any - which is why chasing occupancy on its own is not the same thing as chasing performance.[^4] We will run into that distinction directly once register pressure starts costing us residency.
+How many warps can be resident on an SM at once is not a number you choose - it falls out of what each block asks for. Registers per thread come out of that SM's register file, shared memory per block comes out of that SM's shared memory, and no block may exceed 1024 threads. Ask for more of any one of them and fewer blocks, and so fewer warps, fit. This ratio - how many warps are resident relative to the maximum the SM could hold - is what's called **occupancy**. Note what that does and does not tell you. It is the *capacity* to hide latency, not proof that you are hiding any - which is why chasing occupancy on its own is not the same thing as chasing performance.[^4] We will run into that distinction directly once register pressure starts costing us residency.
 
 Nearly every optimization in this article follows from the warp. Coalescing is about what one warp's 32 addresses look like to the memory system, bank conflicts are about what they look like to shared memory, and tiling is about giving each warp enough arithmetic to chew on while other warps wait.
 
