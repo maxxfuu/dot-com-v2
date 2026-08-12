@@ -133,7 +133,21 @@ How many warps can be resident on an SM at once is not a number you choose - it 
 
 Nearly every optimization in this article follows from the warp. Coalescing is about what one warp's 32 addresses look like to the memory system, bank conflicts are about what they look like to shared memory, and tiling is about giving each warp enough arithmetic to chew on while other warps wait.
 
-This section of the article covers the most bare-bones aspects of CUDA programming and CUDA hardware architecture. It should be just enough to get us started with writing the actual naive kernel. However, if you want to dive deeper into what happens when you run a CUDA kernel, check out Fergus Finn's blog.[^5]
+This section of the article covers the most bare-bones aspects of CUDA programming and CUDA hardware architecture. It should be just enough to follow every kernel that comes after it. However, if you want to dive deeper into what happens when you run a CUDA kernel, check out Fergus Finn's blog.[^5]
+
+## What is GEMM
+
+Before we actually begin writing our GEMM kernels and go through an iterative process on optimizing it, let's first establish what a General Matrix Multiplication (GEMM) is so that we understand what's going on behind the scenes with every implementation. Every kernel in this article computes the exact same thing; an output matrix C computed by matrices A and B. The **GEMM** follow the same mathematical formula listed below:
+
+``` latex
+C \leftarrow \alpha A B + \beta C
+```
+
+Note that variables alpha and beta are just scalar coefficients that scale the matrix multiplication and the existing output matrix C.
+
+**A is (M x K)**, **B is (K x N)**, and **C is (M x N)**. All three of these matrices are stored in row-major order in memory. Each optimized kernel thats introduced within the article will use the following dimensions: **M = N = K = 4096**, **alpha = 1**, **beta = 0**. 
+
+This ensures that very kernel performs the same 2 * M * N * K floating point operations, which is roughly 137 billion operation in total, against the same three matrices. It's really just a basic matrix multiplication.
 
 [^1]: [How CUDA Programming Works - Stephen Jones, CUDA Architect](https://www.youtube.com/watch?v=QQceTDjA4f4&t=75s)
 [^2]: [NVIDIA RTX Blackwell GPU Architecture](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf)
