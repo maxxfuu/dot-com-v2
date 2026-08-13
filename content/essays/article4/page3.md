@@ -141,21 +141,3 @@ Strictly speaking, the traffic to C and the load from A each move **1024 bytes t
 One caveat before we carry that number too far. Sectors are traffic between the L1 and the L2, not traffic out of VRAM. Counted as accesses, this kernel asks for `2 x M x N x K x 4 B = 549.8 GB` of loads, and at 960 GB/s that alone would take 573 ms, yet the kernel finishes in 300.1 ms. Running the bound backwards, VRAM cannot have supplied more than `300.1 ms x 960 GB/s = 288 GB` of that, so a little under half of what we ask for never reaches VRAM at all; the cache is already absorbing it. The waste is real, but it is waste in requests, not in DRAM bytes.
 
 It is worth being precise about what this defect is not. We are not loading too many *values*. The access count stays at exactly `2K` **global loads** per output element, one from A and one from B on every trip through the K loop, and the next kernel will not change it by a single load. We are loading the right values in the wrong *order*, and paying 8x the bytes to get them.
-
-
-<!-- ============================================================
-     THE SEAM - write both sides in one sitting     (step 6, 10 min)
-
-     LAST sentence of this page:  the 1024-bytes-to-deliver-128 cost,
-       plus the note that fixing it changes nothing about the
-       arithmetic - still 2K loads per result.
-
-     FIRST sentence of page4:     picks up that exact number.
-
-     Page 4 must NOT re-teach warps. Chapter 1 already covered warps,
-     SIMT, divergence and latency hiding. siboehm opens his kernel 2
-     with "we need to learn about the concept of a warp" only because
-     he has no chapter 1. Page 4 teaches sectors and transaction
-     sizes, and nothing else.
-     ============================================================ -->
-
