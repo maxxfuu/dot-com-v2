@@ -11,9 +11,9 @@ const int row = blockIdx.y * BLOCKSIZE + threadIdx.x;
 const int col = blockIdx.x * BLOCKSIZE + threadIdx.y;
 ```
 
-Given this mapping, a single thread computes the dot product between a row of A and a column of B, then writes the product into its corresponding output cell in C. 
+Given this mapping, a single thread computes the dot product between a row of A and a column of B, then writes the dot product into its corresponding output cell in C. 
 
-Therefore, we need to write the function for a single thread as everything will be executed in parallel within a warp. For each thread that writes to its own output cell in matrix C, the thread will walk the full K dimension between its corresponding row and column. Written out against our actual function signature, the entire kernel looks like this:
+Therefore, we need to write the kernel for a single thread as everything will be executed in parallel within a warp. For each thread that writes to its own output cell in matrix C, the thread will walk the full K dimension between its corresponding row and column. Written out against our actual function signature, the entire kernel looks like this:
 
 ```cuda
 template <const int BLOCKSIZE>
