@@ -22,7 +22,7 @@ export default function Page() {
         </h1>
         <div className="my-8 space-y-6 text-base leading-[1.85] text-foreground md:text-[1.05rem]">
           <p>
-            I&apos;m a student at UC Merced. I&apos;ve always been drawn to
+            I&apos;ve always been drawn to
             work that&apos;s both technically challenging and visually
             appealing, and chasing it has left me with a{" "}
             <HoverCard>
