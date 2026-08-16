@@ -54,7 +54,9 @@ Firstly, the CUDA hardware linearizes the threads in a block when forming warps.
 
 Secondly, the `CEIL_DIV` represents ceiling division, exists because the matrix dimensions are not required to be multiples of the block size, so we round the grid up and let the last blocks hang over the "edge". This is also why we have to have the boundary check in place; the `if (row < M && col < N)` guard inside the kernel prevents out-of-bounds threads from accessing garbage memory. In our kernel implementation, `M = N = K = 4096` with `BLOCKSIZE = 32` makes the division exact, but writing the kernel as though it isn't costs one comparison and further prevents bugs related to boundedness.
 
-Running this kernel at M = N = K = 4096 takes **300.1 ms**, which works out to **458.0 GFLOP/s**. This will be our first baseline that we will try to optimize against cuBLAS's `cublasSgemm` implementation. Note that the cuBLAS implementation computes the same product in 3.509 ms at 39,168 GFLOP/s. This puts our FP32 SGEMM naive kernel **performance at 1.2%** of cuBLAS.
+Running this kernel at M = N = K = 4096 takes **334.8 ms**, which works out to **410.5 GFLOP/s**. This will be our first baseline that we will try to optimize against cuBLAS's `cublasSgemm` implementation. Note that the cuBLAS implementation computes the same product in 3.817 ms at 36,011 GFLOP/s. This puts our FP32 SGEMM naive kernel **performance at 1.1%** of cuBLAS.
+
+One thing to fix about that reference before it gets quoted eleven more times. It is default math `cublasSgemm` running on the FP32 CUDA cores, not on tensor cores. That matters because this card will do considerably better than 36 TFLOP/s if you let it change the arithmetic: TF32 tensor operations reach roughly 60 TFLOP/s and FP16 inputs with FP32 accumulation roughly 113. No kernel in this article touches tensor cores, so 36,011 GFLOP/s is the honest target, and every percentage from here compares two implementations running on the same units.
 
 
 
@@ -110,9 +112,41 @@ The GPU overlaps arithmetic with memory traffic rather than serializing them, so
 T \geq \max(T_{\text{compute}}, T_{\text{memory}}) = 2.44\text{ ms}
 ```
 
-For now, know that there is no ideal SGEMM kernel with FP32 where dimensions M = N = K = 4096 with this specific GPU can finish in less than **2.44 ms**. With our hand written kernel, SGEMM took 300.1 ms, against a floor of 2.44 ms. It is 123 times slower than the ideal.
+For now, know that there is no ideal SGEMM kernel with FP32 where dimensions M = N = K = 4096 with this specific GPU can finish in less than **2.44 ms**. With our hand written kernel, SGEMM took 334.8 ms, against a floor of 2.44 ms. It is 137 times slower than the ideal.
 
-So really, there's only one question. Where did all this additional time come from and how are we 123 times slower than the theoretical? No single mistake accounts for the whole gap, but the first and the largest of them lies in **transaction**. How many separate chunks the memory system has to fetch to satisfy a single instruction. A memory instruction does not belong to a thread, it belongs to a warp. 
+### Placing The Naive Kernel On The Roofline
+
+Taking the higher of the two floors is not a trick, it is the roofline model from the previous section applied to a whole problem rather than to a kernel. Recall the shape of it: attainable performance is `min(P_peak, AI x BW)`, the ridge point on this card sits at **58.6 FLOP/byte**, and anything below that intensity is memory bound while anything above it is compute bound.
+
+Now we can place two different things on that roofline. First the problem itself. An ideal GEMM reads A, reads B, reads and writes C, which is the 268.4 MB we already counted, and it performs 137.44 GFLOP:
+
+``` latex
+AI_{\text{GEMM}} =
+\frac{137.44\text{ GFLOP}}
+{268.4\text{ MB}}
+\approx 512\text{ FLOP/byte}
+```
+
+512 is far to the right of 58.6, so **GEMM as a problem is compute bound**, by a factor of nearly nine. That is the real reason the compute floor of 2.44 ms won out over the memory floor of 0.28 ms earlier. It also tells us what a good kernel looks like before we write one: matmul has enough reuse available in it that a kernel which exploits that reuse should end up limited by the FP32 units, and every kernel in this article is an attempt to claw back some of that reuse.
+
+Then our actual kernel. Every iteration of the inner loop reads one float from A and one from B, 8 bytes, and performs one multiply and one add, 2 FLOP:
+
+``` latex
+AI_{\text{naive}} =
+\frac{2\text{ FLOP}}
+{8\text{ B}}
+= 0.25\text{ FLOP/byte}
+```
+
+0.25 against a ridge point of 58.6. Our kernel sits **234 times to the left of where it needs to be**, which puts it about as deep into the memory bound region as a kernel can get. The problem it is solving is compute bound and the kernel solving it is memory bound, and that single mismatch is the entire subject of this article.
+
+The model also predicts what that intensity should cost us. At 0.25 FLOP per byte the sloped ceiling sits at `0.25 x 960 GB/s = 240 GFLOP/s`, which works out to 573 ms. We measured 334.8 ms, or 410.5 GFLOP/s, which is 1.7 times faster than the roof says is possible.
+
+Beating the roofline is a sign that one of its assumptions is wrong, and here it is the assumption that every requested byte comes from VRAM. The kernel asks for `2 x M x N x K x 4 B = 549.8 GB` of loads and it does it in 334.8 ms, which is 1642 GB/s of requested bytes against a bus that can only deliver 960. Roughly half of what we ask for never reaches VRAM at all, because the caches are already absorbing it. So the DRAM roofline is not yet the ceiling that binds us. Something closer in is.
+
+That is the honest position after kernel 1. We are memory bound with an intensity 234 times too low, and yet bandwidth is not what we are waiting on. Both of those are true at once, and the second one is the more useful clue.
+
+So really, there's only one question. Where did all this additional time come from and how are we 137 times slower than the theoretical? No single mistake accounts for the whole gap, but the first and the largest of them lies in **transaction**. How many separate chunks the memory system has to fetch to satisfy a single instruction. A memory instruction does not belong to a thread, it belongs to a warp. 
 
 ### Inefficient Warp Memory Access Pattern
 
@@ -138,6 +172,6 @@ Memory comes back from the L1 in `32-byte` sectors. A warp asking for 32 contigu
 
 Strictly speaking, the traffic to C and the load from A each move **1024 bytes to deliver the 128** the warp actually asked for. Seven eighths of every transaction is fetched, paid for, and thrown away, and A pays it on every one of the `K` iterations. Only the load from B escapes, and it escapes by accident: `col` depends on `blockIdx.x` and `threadIdx.y`, both constant across warp 0, so the hardware hands one sector to all 32 lanes.
 
-One caveat before we carry that number too far. Sectors are traffic between the L1 and the L2, not traffic out of VRAM. Counted as accesses, this kernel asks for `2 x M x N x K x 4 B = 549.8 GB` of loads, and at 960 GB/s that alone would take 573 ms, yet the kernel finishes in 300.1 ms. Running the bound backwards, VRAM cannot have supplied more than `300.1 ms x 960 GB/s = 288 GB` of that, so a little under half of what we ask for never reaches VRAM at all; the cache is already absorbing it. The waste is real, but it is waste in requests, not in DRAM bytes.
+One caveat before we carry that number too far. Sectors are traffic between the L1 and the L2, not traffic out of VRAM. Counted as accesses, this kernel asks for `2 x M x N x K x 4 B = 549.8 GB` of loads, and at 960 GB/s that alone would take 573 ms, yet the kernel finishes in 334.8 ms. Running the bound backwards, VRAM cannot have supplied more than `334.8 ms x 960 GB/s = 321 GB` of that, so a little under half of what we ask for never reaches VRAM at all; the cache is already absorbing it. The waste is real, but it is waste in requests, not in DRAM bytes.
 
 It is worth being precise about what this defect is not. We are not loading too many *values*. The access count stays at exactly `2K` **global loads** per output element, one from A and one from B on every trip through the K loop, and the next kernel will not change it by a single load. We are loading the right values in the wrong *order*, and paying 8x the bytes to get them.

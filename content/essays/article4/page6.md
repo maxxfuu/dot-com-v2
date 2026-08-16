@@ -8,11 +8,23 @@ Shared memory is the fix. It is a small block of memory that lives on the SM, it
 
 The strips do not fit. A full 32 row strip of A at `K = 4096` is `32 x 4096 x 4 B = 512 KB`, and we only have 100 KB of shared memory per SM. So we walk the strips in chunks. The block loads a `32 x 32` tile of A and a `32 x 32` tile of B, does all the multiplying it can with those two tiles, then slides both windows along K and does it again. `K / 32 = 128` trips around that loop and the tile of C is finished.
 
-![One thread block owns a 32 x 32 tile of C, named by cRow and cCol. Each trip around the outer loop copies a 32 x 32 tile of A and a 32 x 32 tile of B from global memory into shared memory as As and Bs, 8 KB resident per block, then slides A right by 32 columns and B down by 32 rows for the next trip.](/images/gemm/smem-tiling-overview.png "full")
+![One thread block owns a 32 x 32 tile of C, named by cRow and cCol, with M = N = K = 4096. Each trip around the outer loop copies a 32 x 32 tile of A and a 32 x 32 tile of B from global memory into shared memory as As and Bs, 8 KB resident per block, then slides A right by 32 columns and B down by 32 rows for the next trip.](/images/gemm/smem-tiling-overview.png "full")
 
-Inside one trip the block does four things in order. Every thread copies one element of A and one element of B into shared memory, then the block syncs, then every thread runs a 32 step dot product entirely out of shared memory, then the block syncs again. There are 1024 threads and each tile has exactly 1024 elements, so the load is one element per thread with nothing left over and no loop needed.
+Inside one trip the block does four things in order. Every thread copies one element of A and one element of B into shared memory, then the block syncs, then every thread runs a 32 step dot product entirely out of shared memory, then the block syncs again. There are 1024 threads and each tile has exactly 1024 elements, so the load is one element per thread with nothing left over and no loop needed. The figure below calls a thread's position `tx` and `ty`; the code calls them `threadCol` and `threadRow` and recovers them from the flat `threadIdx.x` with the `%` and `/` from the previous kernel, which is the same position by a different name.
 
-![Load: each of the 1024 threads copies one element of the A tile and one element of the B tile into As and Bs, using tx and ty taken from its flat thread index, and then calls syncthreads. Compute: thread (tx, ty) walks row ty of As against column tx of Bs for 32 multiply accumulates with no global memory traffic at all, and syncs again before the next tile overwrites shared memory.](/images/gemm/smem-load-sync-compute.png "full")
+![Two panels. Load: each of the 1024 threads copies one element of the A tile and one of the B tile out of global memory into As and Bs, so thread (tx, ty) owns exactly one cell of each, and then calls syncthreads, which means the tile is whole before anyone reads it. Compute: thread (tx, ty) walks row ty of As against column tx of Bs for 32 multiply accumulates with no global memory traffic at all, summing into C[ty][tx], and syncs again before the next tile overwrites shared memory.](/images/gemm/smem-load-sync-compute.png "full")
+
+The launch is one block per `32 x 32` tile of C, 1024 flat threads per block, the same shape kernel 3 used. The one oddity is the grid: this kernel takes its row from `blockIdx.x`, so the grid dimensions are swapped relative to every other kernel in the series.
+
+```cuda
+const int TILESIZE = 32;
+
+// note the order: x walks M here, not N
+dim3 gridDim(CEIL_DIV(M, TILESIZE), CEIL_DIV(N, TILESIZE));
+dim3 blockDim(TILESIZE * TILESIZE);
+
+sgemm_shared_mem_block<TILESIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+```
 
 ```cuda
 template <const int TILESIZE>
@@ -62,7 +74,9 @@ __global__ void sgemm_shared_mem_block(int M, int N, int K, float alpha, const f
 
 4. **`blockIdx` is shadowed.** The loop counter is named `blockIdx`, which hides the built in variable of the same name for the rest of the loop body. It compiles and runs correctly here only because `cRow` and `cCol` were read out before the loop, so nothing inside the loop needs the real one. It is worth renaming to `bk` before this kernel gets copied into the next one.
 
-Kernel 4 runs in **30.201 ms at 4550.9 GFLOP/s, which is 11.6% of cuBLAS at `M = N = K = 4096`**, up from 43.320 ms and 8.1%.
+5. **`cRow` comes from `blockIdx.x`, and the launch compensates.** Every other kernel in this series takes its row from `blockIdx.y` and launches `gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM))`. This one is the exception in both places at once, so the two mistakes cancel and the kernel is correct. The figure above draws the conventional orientation, `cRow` from `blockIdx.y`, because that is what the rest of the series uses; read it as the tile geometry rather than as the literal index assignment. Two consequences worth knowing. It only survives because `M = N` here, so the two grid extents are equal and nothing indexes past the end; at `M != N` this kernel reads out of bounds. And the next kernel quietly switches back to the conventional mapping, which is worth noticing rather than absorbing.
+
+Kernel 4 runs in **33.268 ms at 4131.3 GFLOP/s, which is 11.5% of cuBLAS at `M = N = K = 4096`**, up from 47.007 ms and 8.1%.
 
 ### The Arithmetic
 
@@ -75,11 +89,19 @@ GMEM accesses per result = (K / BK) * (BM*BK + BK*BN) / (BM*BN)
 
 At `BM = BN = 32` that is `4096 / 16 = 256` global loads per output element, against `2K = 8192` for every kernel so far. **32 times fewer.** Counted as bytes over the whole matrix it is 549.8 GB of global loads down to **17.2 GB**. Arithmetic intensity goes from 0.25 FLOP per byte to 8, because the same 8192 FLOP per output now sit behind 1024 bytes of global traffic instead of 32768.
 
-And the runtime went from 43.3 ms to 30.2 ms, which is 1.43 times faster.
+And the runtime went from 47.0 ms to 33.3 ms, which is 1.41 times faster.
+
+### Where We Are On The Roofline
+
+This is the first kernel that moves on the roofline at all. Intensity goes from `0.25` to `8 FLOP/byte`, a 32 times move to the right, and it is still `7.3` times short of the 58.6 ridge point, so the kernel is still nominally memory bound.
+
+What changed is that the model finally applies. The sloped ceiling at 8 FLOP per byte sits at `8 x 960 GB/s = 7680 GFLOP/s`, and we measured 4131.3, which is **54% of the roof**. Kernels 1 and 2 both ran above their roof because the caches were quietly serving most of the requests. Kernel 4 is the first one to sit underneath it, and the reason is that 17.2 GB in 33.3 ms is only 516 GB/s of requested traffic, which is a number a 960 GB/s bus can plausibly supply on its own.
+
+Read as a floor, the same arithmetic says 17.2 GB at 960 GB/s costs `17.9 ms`, and we are at 33.3. So there is still 1.9 times of headroom before global bandwidth becomes the thing stopping us, and the compute floor of 2.44 ms is further away still. We are not bound by either ceiling on the roofline. Whatever is costing us the other 15 ms is inside the SM.
 
 ### What Is Still Wrong
 
-That gap is the whole point of this section. Global traffic fell by a factor of 32 and the kernel got 1.43 times faster, so global traffic was not what the kernel was waiting on any more. The work did not disappear, it moved.
+That gap is the whole point of this section. Global traffic fell by a factor of 32 and the kernel got 1.41 times faster, so global traffic was not what the kernel was waiting on any more. The work did not disappear, it moved.
 
 Look at what the inner loop actually costs. Each of the 32 steps reads one float out of `As` and one out of `Bs` to feed a single multiply accumulate, so the shared memory access count per output element is `2K = 8192`, which is exactly the number global memory used to carry. We swapped a 500 cycle load for a 25 cycle load and kept the count identical. Every FMA in this kernel is still paying for two loads to feed it, they are just cheaper loads now.
 
