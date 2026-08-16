@@ -139,6 +139,68 @@ function normalizeHeading(text: string) {
   return text.trim().toLowerCase();
 }
 
+// GFM pipe tables. A table is a header row, a delimiter row, then body rows:
+//   | load  | naive      | coalesced |
+//   |-------|------------|-----------|
+//   | A     | 32 sectors | 1 sector  |
+// Outer pipes are optional, and a colon in the delimiter row sets the column's
+// alignment (`:---` left, `:---:` center, `---:` right).
+const tableDelimiterPattern = /^\s*\|?(\s*:?-+:?\s*\|)*\s*:?-+:?\s*\|?\s*$/;
+
+function isTableRow(line: string | undefined) {
+  return Boolean(line?.trim().startsWith("|"));
+}
+
+// A table needs both lines to commit: a lone `|` line is just a paragraph.
+function isTableStart(lines: string[], index: number) {
+  return (
+    isTableRow(lines[index]) &&
+    lines[index + 1] !== undefined &&
+    tableDelimiterPattern.test(lines[index + 1]) &&
+    lines[index + 1].includes("-")
+  );
+}
+
+// Split on unescaped pipes, dropping the optional outer pair. `\|` survives as a
+// literal so a cell can contain one.
+function splitTableRow(line: string) {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const cells: string[] = [];
+  let cell = "";
+
+  for (let i = 0; i < trimmed.length; i += 1) {
+    if (trimmed[i] === "\\" && trimmed[i + 1] === "|") {
+      cell += "|";
+      i += 1;
+      continue;
+    }
+
+    if (trimmed[i] === "|") {
+      cells.push(cell.trim());
+      cell = "";
+      continue;
+    }
+
+    cell += trimmed[i];
+  }
+
+  cells.push(cell.trim());
+
+  return cells;
+}
+
+function tableAlignments(delimiter: string) {
+  return splitTableRow(delimiter).map((cell) => {
+    const left = cell.startsWith(":");
+    const right = cell.endsWith(":");
+
+    if (left && right) return "text-center";
+    if (right) return "text-right";
+
+    return "text-left";
+  });
+}
+
 interface BlogMarkdownProps {
   body: string;
   title?: string;
@@ -442,6 +504,62 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       continue;
     }
 
+    if (isTableStart(lines, index)) {
+      const header = splitTableRow(lines[index]);
+      const alignments = tableAlignments(lines[index + 1]);
+      index += 2;
+
+      const rows: string[][] = [];
+
+      while (index < lines.length && isTableRow(lines[index])) {
+        rows.push(splitTableRow(lines[index]));
+        index += 1;
+      }
+
+      elements.push(
+        <div key={`table-${index}`} className="my-10 overflow-x-auto">
+          <table className="w-full border-collapse text-sm leading-[1.7] text-foreground">
+            <thead>
+              <tr className="border-b border-neutral-300 dark:border-neutral-700">
+                {header.map((cell, cellIndex) => (
+                  <th
+                    key={`th-${cellIndex}`}
+                    className={`px-3 py-2 font-medium ${
+                      alignments[cellIndex] ?? "text-left"
+                    }`}
+                  >
+                    {renderInlineMarkdown(cell)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr
+                  key={`tr-${rowIndex}`}
+                  className="border-b border-neutral-200 last:border-0 dark:border-neutral-800"
+                >
+                  {/* Pad short rows so the columns stay aligned. */}
+                  {header.map((_, cellIndex) => (
+                    <td
+                      key={`td-${cellIndex}`}
+                      className={`px-3 py-2 align-top ${
+                        alignments[cellIndex] ?? "text-left"
+                      }`}
+                    >
+                      {renderInlineMarkdown(row[cellIndex] ?? "")}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+
+      continue;
+    }
+
     const paragraphLines = [line];
     index += 1;
 
@@ -455,7 +573,8 @@ export async function BlogMarkdown({ body, title }: BlogMarkdownProps) {
       !orderedItemPattern.test(lines[index]) &&
       !lines[index].startsWith("```") &&
       !lines[index].trim().startsWith(":::") &&
-      !lines[index].trim().startsWith("![")
+      !lines[index].trim().startsWith("![") &&
+      !isTableStart(lines, index)
     ) {
       paragraphLines.push(lines[index]);
       index += 1;
