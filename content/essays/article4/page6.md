@@ -23,44 +23,53 @@ const int TILESIZE = 32;
 dim3 gridDim(CEIL_DIV(M, TILESIZE), CEIL_DIV(N, TILESIZE));
 dim3 blockDim(TILESIZE * TILESIZE);
 
-sgemm_shared_mem_block<TILESIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+sgemm_smem_block<TILESIZE><<<gridDim, blockDim>>>(A, B, C, M, N, K, alpha, beta);
 ```
 
 ```cuda
 template <const int TILESIZE>
-__global__ void sgemm_shared_mem_block(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
-  const int cRow = blockIdx.x;
-  const int cCol = blockIdx.y;
+__global__ void sgemm_smem_block(float *A_gmem, float *B_gmem, float *C_gmem, int M, int N, int K, float alpha, float beta) {
+  // Define block position within the grid
+  const int C_Row = blockIdx.x;
+  const int C_Col = blockIdx.y;
 
-  __shared__ float As[TILESIZE * TILESIZE];
-  __shared__ float Bs[TILESIZE * TILESIZE];
-
+  // Define thread position relative to a tile shape in matrix C
   const int threadRow = threadIdx.x / TILESIZE;
   const int threadCol = threadIdx.x % TILESIZE;
 
-  A += cRow * TILESIZE * K;                    
-  B += cCol * TILESIZE;                        
-  C += cRow * TILESIZE * N + cCol * TILESIZE; 
+  // Shift the pointers into global memory so each one points at the top left
+  // corner of this block's tile.
+  A_gmem += C_Row * TILESIZE * K;
+  B_gmem += C_Col * TILESIZE;
+  C_gmem += C_Row * TILESIZE * N + C_Col * TILESIZE;
 
-  float temp = 0.0;
-  for (int blockIdx = 0; blockIdx < K; blockIdx += TILESIZE) {
-    As[threadRow * TILESIZE + threadCol] = A[threadRow * K + threadCol];
-    Bs[threadRow * TILESIZE + threadCol] = B[threadRow * N + threadCol];
+  __shared__ float A_smem[TILESIZE * TILESIZE];
+  __shared__ float B_smem[TILESIZE * TILESIZE];
 
+  float temp = 0.0f;
+
+  for (int block_k = 0; block_k < K; block_k += TILESIZE) {
+    // one element per thread, GMEM -> SMEM
+    A_smem[threadRow * TILESIZE + threadCol] = A_gmem[threadRow * K + threadCol];
+    B_smem[threadRow * TILESIZE + threadCol] = B_gmem[threadRow * N + threadCol];
+
+    // the tile must be whole before anyone reads it
     __syncthreads();
 
-    A += TILESIZE;
-    B += TILESIZE * N;
+    // advance A right by one tile, B down by one tile
+    A_gmem += TILESIZE;
+    B_gmem += TILESIZE * N;
 
-    for (int k = 0; k < TILESIZE; ++k) {
-      temp += As[threadRow * TILESIZE + k] *  Bs[k * TILESIZE + threadCol];
+    // partial dot product, entirely out of shared memory
+    for (int dot_k = 0; dot_k < TILESIZE; ++dot_k) {
+      temp += A_smem[threadRow * TILESIZE + dot_k] * B_smem[dot_k * TILESIZE + threadCol];
     }
 
+    // everyone must finish reading before the next trip overwrites SMEM
     __syncthreads();
   }
 
-  C[threadRow * N + threadCol] =
-      alpha * temp + beta * C[threadRow * N + threadCol];
+  C_gmem[threadRow * N + threadCol] = alpha * temp + beta * C_gmem[threadRow * N + threadCol];
 }
 ```
 
