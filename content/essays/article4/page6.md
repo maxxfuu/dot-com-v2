@@ -31,52 +31,51 @@ sgemm_shared_mem_block<TILESIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, be
 ```
 
 This is the SMEM tiling kernel: 
-
-```cuda
+``` cuda 
 template <const int TILESIZE>
-__global__ void sgemm_shared_mem_block(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+__global__ void sgemm_smem_block(float *A_gmem, float *B_gmem, float *C_gmem, int M, int N, int K, float alpha, float beta) {
   // Define block position within the grid
-  const int cRow = blockIdx.x;
-  const int cCol = blockIdx.y;
+  const int C_Row = blockIdx.x;
+  const int C_Col = blockIdx.y;
   
   // Define thread position relative to a tile shape in matrix C
   const int threadRow = threadIdx.x / TILESIZE;
   const int threadCol = threadIdx.x % TILESIZE;
   
   // Shift the pointers of the matrices within the global memory. Move them to always point at the top left corner of a tile. 
-  A += cRow * TILESIZE * K ;
-  B += cCol * TILESIZE;
-  C += cRow * TILESIZE * N + cCol * TILESIZE ;
+  A_gmem += C_Row * TILESIZE * K ;
+  B_gmem += C_Col * TILESIZE;
+  C_gmem += C_Row * TILESIZE * N + C_Col * TILESIZE ;
  
   // declare 2D array in SMEM
-  __shared__ float As[TILESIZE * TILESIZE];
-  __shared__ float Bs[TILESIZE * TILESIZE];
+  __shared__ float A_smem[TILESIZE * TILESIZE];
+  __shared__ float B_smem[TILESIZE * TILESIZE];
 
   float temp = 0.0f;
 
   // load data and advance the global pointers
-  for (int blockIdx = 0; blockIdx < K; blockIdx += TILESIZE) {
+  for (int block_k = 0; block_k < K; block_k += TILESIZE) {
     // load 1 element per thread from GMEM into SMEM 
-    As[threadRow * TILESIZE + threadCol] = A[threadRow * K + threadCol];
-    Bs[threadRow * TILESIZE + threadCol] = B[threadRow * N + threadCol];
+    A_smem[threadRow * TILESIZE + threadCol] = A_gmem[threadRow * K + threadCol];
+    B_smem[threadRow * TILESIZE + threadCol] = B_gmem[threadRow * N + threadCol];
     
     // wait for all threads to finish loading values from GMEM to SMEM
     __syncthreads();
     
     // advance A to the right by 1 tile. advance B down by one tile. 
-    A += TILESIZE;
-    B += TILESIZE * N;
+    A_gmem += TILESIZE;
+    B_gmem += TILESIZE * N;
     
     // compute partial dot product within the tile 
-    for (int k = 0; k < TILESIZE; ++k) {
-      temp += As[threadRow * TILESIZE + k] * Bs[k * TILESIZE + threadCol];
+    for (int block_k = 0; block_k < TILESIZE; ++block_k) {
+      temp += A_smem[threadRow * TILESIZE + block_k] * B_smem[block_k * TILESIZE + threadCol];
     }
 
     // wait for all threads to finish computing before next iteration loads data
     __syncthreads();
   }
 
-  C[threadRow * N + threadCol] = alpha * temp + beta * C[threadRow * N + threadCol];
+  C_gmem[threadRow * N + threadCol] = alpha * temp + beta * C_gmem[threadRow * N + threadCol];
 }
 
 ```
