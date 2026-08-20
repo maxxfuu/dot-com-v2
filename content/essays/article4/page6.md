@@ -21,68 +21,68 @@ For Matrix A, to load the corresponding 32x32 tile into shared memory, the threa
 Here is how you launch the kernel:
 
 ```cuda
-const int TILESIZE = 32;
+const int BLOCKSIZE = 32;
 
 // note the order: x walks M here, not N
-dim3 gridDim(CEIL_DIV(M, TILESIZE), CEIL_DIV(N, TILESIZE));
-dim3 blockDim(TILESIZE * TILESIZE);
+dim3 gridDim(CEIL_DIV(M, BLOCKSIZE), CEIL_DIV(N, BLOCKSIZE));
+dim3 blockDim(BLOCKSIZE * BLOCKSIZE);
 
-sgemm_shared_mem_block<TILESIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+sgemm_smem_tiling<BLOCKSIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 ```
 
 This is the SMEM tiling kernel: 
 ``` cuda 
-template <const int TILESIZE>
-__global__ void sgemm_smem_block(float *A_gmem, float *B_gmem, float *C_gmem, int M, int N, int K, float alpha, float beta) {
-  // Define block position within the grid
-  const int C_Row = blockIdx.x;
-  const int C_Col = blockIdx.y;
-  
-  // Define thread position relative to a tile shape in matrix C
-  const int threadRow = threadIdx.x / TILESIZE;
-  const int threadCol = threadIdx.x % TILESIZE;
-  
-  // Shift the pointers of the matrices within the global memory. Move them to always point at the top left corner of a tile. 
-  A_gmem += C_Row * TILESIZE * K ;
-  B_gmem += C_Col * TILESIZE;
-  C_gmem += C_Row * TILESIZE * N + C_Col * TILESIZE ;
- 
-  // declare 2D array in SMEM
-  __shared__ float A_smem[TILESIZE * TILESIZE];
-  __shared__ float B_smem[TILESIZE * TILESIZE];
+template <const int BLOCKSIZE>
+__global__ void sgemm_smem_tiling(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+  // block position within the grid
+  const int cRow = blockIdx.x;
+  const int cCol = blockIdx.y;
 
-  float temp = 0.0f;
+  // the two tiles this block stages in shared memory
+  __shared__ float As[BLOCKSIZE * BLOCKSIZE];
+  __shared__ float Bs[BLOCKSIZE * BLOCKSIZE];
 
-  // load data and advance the global pointers
-  for (int block_k = 0; block_k < K; block_k += TILESIZE) {
-    // load 1 element per thread from GMEM into SMEM 
-    A_smem[threadRow * TILESIZE + threadCol] = A_gmem[threadRow * K + threadCol];
-    B_smem[threadRow * TILESIZE + threadCol] = B_gmem[threadRow * N + threadCol];
-    
-    // wait for all threads to finish loading values from GMEM to SMEM
+  // thread position within the block's tile of C
+  const int threadRow = threadIdx.x / BLOCKSIZE;
+  const int threadCol = threadIdx.x % BLOCKSIZE;
+
+  // move each pointer to the top left corner of this block's tile
+  A += cRow * BLOCKSIZE * K;
+  B += cCol * BLOCKSIZE;
+  C += cRow * BLOCKSIZE * N + cCol * BLOCKSIZE;
+
+  float acc = 0.0f;
+  for (int bkIdx = 0; bkIdx < K; bkIdx += BLOCKSIZE) {
+    // one element per thread, GMEM -> SMEM
+    As[threadRow * BLOCKSIZE + threadCol] = A[threadRow * K + threadCol];
+    Bs[threadRow * BLOCKSIZE + threadCol] = B[threadRow * N + threadCol];
+
+    // block all threads until the shared memory is fully populated
     __syncthreads();
-    
-    // advance A to the right by 1 tile. advance B down by one tile. 
-    A_gmem += TILESIZE;
-    B_gmem += TILESIZE * N;
-    
-    // compute partial dot product within the tile 
-    for (int block_k = 0; block_k < TILESIZE; ++block_k) {
-      temp += A_smem[threadRow * TILESIZE + block_k] * B_smem[block_k * TILESIZE + threadCol];
+
+    // advance A right by one tile, B down by one tile
+    A += BLOCKSIZE;
+    B += BLOCKSIZE * N;
+
+    // partial dot product over the cached tile
+    for (int k = 0; k < BLOCKSIZE; ++k) {
+      acc += As[threadRow * BLOCKSIZE + k] * Bs[k * BLOCKSIZE + threadCol];
     }
 
-    // wait for all threads to finish computing before next iteration loads data
+    // sync again at the end, so a fast thread cannot overwrite the tile
+    // a slow thread is still reading
     __syncthreads();
   }
 
-  C_gmem[threadRow * N + threadCol] = alpha * temp + beta * C_gmem[threadRow * N + threadCol];
+  C[threadRow * N + threadCol] =
+      alpha * acc + beta * C[threadRow * N + threadCol];
 }
 
 ```
 
 ### Mechanics
 
-1. The pointers `A`, `B`, and `C` are advanced to the block's top left corner before the loop starts. Each pointer marks the relative starting point for a tile. To move the pointers, `A += TILESIZE` has to step 32 columns right and `B += TILESIZE * N` has to step 32 rows down.
+1. The pointers `A`, `B`, and `C` are advanced to the block's top left corner before the loop starts. Each pointer marks the relative starting point for a tile. To move the pointers, `A += BLOCKSIZE` has to step 32 columns right and `B += BLOCKSIZE * N` has to step 32 rows down.
 
 2. The first `__syncthreads()` guards fill before read. A thread that reaches the dot product early would otherwise read cells of `As` and `Bs` that another warp has not written yet, and it would read whatever was there before. The second one guards read before overwrite. Without it a fast warp comes around the loop and starts writing the next tile into `As` while a slow warp is still multiplying with the current one. Removing either is a race, and neither will fail every time, which is what makes them nasty.
 
@@ -102,7 +102,7 @@ The shared memory tiling kernel moves the arithmetic intensity based on the roof
 
 ![The same RTX 5080 roofline as before, with the naive kernel sitting at an arithmetic intensity of 0.25 FLOP/byte and 0.24 TFLOP/s. Shared memory tiling moves the kernel 32 times to the right along the 960 GB/s slope, to 8 FLOP/byte, and the attainable performance climbs with it. It is still on the sloped part of the roof: the ridge point is at 58.6 FLOP/byte, so the kernel is 7.3 times short of the intensity it would need to leave the memory bound region and hit the 56.3 TFLOP/s FP32 ceiling.](/images/gemm/roofline-smem-tiling.png "full")
 
-### What Is Still Wrong
+### What Could Be Improved
 
 Shared memory tiling dropped the global memory traffic by 32 times. However, against the previous kernel we've only increased the speed by a factor of 1.41x. This makes sense because we simply shifted the traffic from the global memory to shared memory, and as a result we are now bounded by shared memory bandwidth. 
 

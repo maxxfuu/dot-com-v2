@@ -35,12 +35,12 @@ What changed is the ratio between the two paths. Per K-tile this kernel issues:
 | `LDS.128`, the vector loads feeding the FMAs | 96 |
 | `FFMA` | 2048 |
 
-The conflicting stores are 0.7% of the instruction stream, which is what the previous section already established. The new problem is that the padding is not free on the other side. `ASTRIDE = 130` is not a multiple of 4, so `dotIdx * ASTRIDE` is only 8 byte aligned on odd `dotIdx`, and a `LDS.128` cannot issue against an 8 byte aligned address. Half of those 96 vector loads split into pairs of `LDS.64`. Kernel 11's SASS shows exactly that: 96 `LDS.128` and an extra 64 `LDS.64` that should not exist.
+The conflicting stores are 0.7% of the instruction stream, which is what the previous section already established. The new problem is that the padding is not free on the other side. `A_STRIDE = 130` is not a multiple of 4, so `dotIdx * A_STRIDE` is only 8 byte aligned on odd `dotIdx`, and a `LDS.128` cannot issue against an 8 byte aligned address. Half of those 96 vector loads split into pairs of `LDS.64`. Kernel 11's SASS shows exactly that: 96 `LDS.128` and an extra 64 `LDS.64` that should not exist.
 
-So the padding pays a tax on the hot path, 96 loads per tile, to fix a conflict on the cold one, 16 stores per tile. Removing it is measurably faster, and `ASTRIDE` becomes `BM`:
+So the padding pays a tax on the hot path, 96 loads per tile, to fix a conflict on the cold one, 16 stores per tile. Removing it is measurably faster, and `A_STRIDE` becomes `BM`:
 
 ```cuda
-constexpr int ASTRIDE = BM;
+constexpr int A_STRIDE = BM;
 ```
 
 This is the most useful single fact in the article. A profiler-driven fix, correctly derived and correctly measured, became a pessimization four kernels later, and nothing about the padded kernel itself changed to signal it. Its premise expired.
@@ -51,7 +51,7 @@ There is one saving here that is not a retune. Every kernel since the 2D registe
 
 ```cuda
 float4 tmp = reinterpret_cast<float4 *>(cPtr)[0];   // read C back
-tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
+tmp.x = alpha * threadResults[accIdx + 0] + beta * tmp.x;
 ```
 
 When `beta == 0` that read is pure waste. The value loaded is multiplied by zero and thrown away, and it costs a full pass over C: `M x N x 4 = 67 MB` of DRAM reads that cannot hit in L2, because C is 67 MB against a 64 MB cache and is streamed exactly once. At 960 GB/s that is roughly 70 microseconds on a 4 ms kernel, and the measured gain is larger than that, because those loads also occupy issue slots in the epilogue.
@@ -83,7 +83,7 @@ Note the direction. We are asking for lower occupancy on purpose, and the flag t
 
 `ptxas` reports 0 bytes spilled at 227 registers, and that headroom is the only reason this configuration is legal. It is worth re-checking with `-Xptxas -v` after any edit, because the cliff on the other side of it is very steep.
 
-### The Code
+### The Kernel
 
 ```cuda
 const int BM = 128, BN = 128, BK = 16, WM = 64, WN = 64, WNITER = 2;
@@ -102,9 +102,9 @@ sgemm_final(int M, int N, int K, float alpha, const float *A, const float *B, fl
   const int cRow = blockIdx.y;
   const int cCol = blockIdx.x;
 
-  constexpr int ASTRIDE = BM;
+  constexpr int A_STRIDE = BM;
 
-  __shared__ float As[2][BK * ASTRIDE];
+  __shared__ float As[2][BK * A_STRIDE];
   __shared__ float Bs[2][BK * BN];
 
   // ... prologue, main loop and staging are kernel 11's, unchanged ...
@@ -112,16 +112,16 @@ sgemm_final(int M, int N, int K, float alpha, const float *A, const float *B, fl
   if constexpr (BETA_IS_ZERO) {
     for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow) {
       for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol) {
-        float *C_sub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
+        float *cSub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
         for (int m = 0; m < TM; ++m) {
           for (int n = 0; n < TN; n += 4) {
-            float *cPtr = &C_sub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
-            const int i = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
+            float *cPtr = &cSub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
+            const int accIdx = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
             float4 out;
-            out.x = alpha * threadResults[i + 0];
-            out.y = alpha * threadResults[i + 1];
-            out.z = alpha * threadResults[i + 2];
-            out.w = alpha * threadResults[i + 3];
+            out.x = alpha * threadResults[accIdx + 0];
+            out.y = alpha * threadResults[accIdx + 1];
+            out.z = alpha * threadResults[accIdx + 2];
+            out.w = alpha * threadResults[accIdx + 3];
             reinterpret_cast<float4 *>(cPtr)[0] = out;
           }
         }
@@ -202,7 +202,7 @@ Indistinguishable. All four points belonged to the launch bounds argument.
 
 The `if constexpr` form is kept, because it is the honest way to say "these are two different kernels" and it costs nothing, but it is not why this kernel is fast. The lesson is about method rather than about GEMM: an A/B that changes two things at once produces a real, repeatable and entirely false number, and a plausible mechanism will always suggest itself for whichever of the two changes you were already interested in.
 
-### What Is Still Wrong, And What It Would Take
+### What Could Be Improved, And What It Would Take
 
 We are at 3.929 ms against cuBLAS at 3.817 ms, so the remaining gap is 2.9% at `M = N = K = 4096`. Run to run spread on this kernel is 1.17%, so that gap is real but only just.
 
@@ -214,6 +214,8 @@ Several things were tried against it and did not work, and they are worth record
 - **256 thread blocks** in three shapes. All fell to one block per SM and lost six to eleven points.
 
 What would actually close 2.9% is not on the list, because it is not in this series' scope. cuBLAS at this size is running a hand tuned assembly kernel with a schedule no compiler will reproduce from CUDA C, and beyond that it can select tensor core paths that this article deliberately never touches. Every kernel here runs on FP32 CUDA cores, and the 3.817 ms reference is `cublasSgemm` on the same units, which is what makes the comparison fair. Switching to TF32 or FP16 with FP32 accumulation would make this kernel several times faster and would be answering a different question.
+
+One measurement makes the size of that remaining gap concrete. Nsight puts this kernel at **2.55 warp cycles per issued instruction with `Stall Not Selected` at 32.5%**, and cuBLAS's cutlass kernel at **2.55 cycles with Not Selected at 33.3%**. The two stall profiles are indistinguishable. Whatever the last 2.9% is, it is not a stall this kernel suffers and cuBLAS avoids. Both sit in the regime where the scheduler has more eligible warps than it can issue, and what separates them is the instruction schedule itself.
 
 The more honest closing note is about the shape of the ladder rather than its last rung. Twelve kernels moved us from 410.5 GFLOP/s to 34978.3, which is 85 times, and the techniques responsible are not exotic: read memory in the order it is laid out, load each value once per block instead of once per thread, give each thread enough work that its loads amortize, hand the hardware its widest instructions, keep each warp's footprint compact, overlap loading with arithmetic, and then measure everything again because the earlier decisions have gone stale. Almost all of it is data movement, and almost none of it is arithmetic.
 

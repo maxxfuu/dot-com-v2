@@ -10,9 +10,9 @@ So give a thread more than one output. Let one thread own a short column of C, `
 
 That is the whole idea, and the accounting for it is immediate. Per step of the K loop a thread reads `1` value of B and `TM` values of A, so `1 + TM` reads produce `TM` results instead of `2` reads producing `1`.
 
-![One thread at one step of the BK loop. Kernel 4's two shared memory reads per result become 1 + TM reads for TM results: a single read from the Bs row lands in a register and is reused TM times, while TM values are read down a column of As, and the two feed TM = 8 fused multiply-adds accumulating into 8 registers. The figure names the broadcast register Btmp; the listing below calls it tmpB.](/images/gemm/register-1d-inner-loop.png "large")
+![One thread at one step of the BK loop. Kernel 4's two shared memory reads per result become 1 + TM reads for TM results: a single read from the Bs row lands in a register and is reused TM times, while TM values are read down a column of As, and the two feed TM = 8 fused multiply-adds accumulating into 8 registers. The figure names the broadcast register Btmp; the listing below calls it regN.](/images/gemm/register-1d-inner-loop.png "large")
 
-### The Code
+### The Kernel
 
 The tile shape changes along with the thread mapping. The block now owns a `64 x 64` tile of C and walks K in steps of `BK = 8`, and because each thread produces `TM = 8` outputs the block needs `(64 x 64) / 8 = 512` threads rather than 4096:
 
@@ -22,12 +22,12 @@ const int BM = 64, BN = 64, BK = 8, TM = 8;
 dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
 dim3 blockDim((BM * BN) / TM);   // 512
 
-sgemm_register_1d_tiling<BM, BN, BK, TM><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+sgemm_register_tiling_1d<BM, BN, BK, TM><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 ```
 
 ```cuda
 template <const int BM, const int BN, const int BK, const int TM>
-__global__ void sgemm_register_1d_tiling(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+__global__ void sgemm_register_tiling_1d(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
 
   const int cRow = blockIdx.y;
   const int cCol = blockIdx.x;
@@ -62,9 +62,9 @@ __global__ void sgemm_register_1d_tiling(int M, int N, int K, float alpha, const
     B += BK * N;
 
     for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
-      float tmpB = Bs[dotIdx * BN + threadCol]; 
+      float regN = Bs[dotIdx * BN + threadCol]; 
       for (int resIdx = 0; resIdx < TM; ++resIdx) {
-        threadResults[resIdx] += As[(threadRow * TM + resIdx) * BK + dotIdx] * tmpB;
+        threadResults[resIdx] += As[(threadRow * TM + resIdx) * BK + dotIdx] * regN;
       }
     }
     __syncthreads();
@@ -80,7 +80,7 @@ __global__ void sgemm_register_1d_tiling(int M, int N, int K, float alpha, const
 
 ### Mechanics
 
-1. **One hoisted line is the entire kernel.** `float tmpB = Bs[dotIdx * BN + threadCol];` sits outside the `resIdx` loop, so the B value is read once and reused `TM` times from a register. Move that line inside the inner loop and you have written kernel 4 again with extra steps: same results, same arithmetic, eight times the shared memory reads. Everything else in this file is bookkeeping to make that hoist possible.
+1. **One hoisted line is the entire kernel.** `float regN = Bs[dotIdx * BN + threadCol];` sits outside the `resIdx` loop, so the B value is read once and reused `TM` times from a register. Move that line inside the inner loop and you have written kernel 4 again with extra steps: same results, same arithmetic, eight times the shared memory reads. Everything else in this file is bookkeeping to make that hoist possible.
 
 2. **The same 512 threads are decomposed two different ways.** For loading, `innerRowA`/`innerColA` cut the block into a `64 x 8` grid matching the shape of the A tile, and `innerRowB`/`innerColB` cut it into `8 x 64` matching the B tile. For computing, `threadRow`/`threadCol` cut it into `8 x 64`, where the row index is scaled by `TM` on use. This is what kernel 3 was for. None of these three shapes is the launch shape, and all three come out of the same flat `threadIdx.x`.
 
@@ -106,9 +106,11 @@ against `2K = 8192` for kernel 4. That is a factor of **1.78**, and the runtime 
 
 The reason is that a shared memory read is not only a latency to be hidden, it is an instruction to be issued. Kernel 4's inner loop issued two `LDS` and one `FFMA` per output; this one issues nine `LDS` and eight `FFMA` per eight outputs. The loads that disappeared took issue slots with them, and the ratio of memory instructions to arithmetic instructions went from 2:1 to 9:8. Access counts measure bytes touched. They do not measure the instruction stream, and from here on the instruction stream is increasingly what we are fighting.
 
+Nsight measures that shift directly. Kernel 4 sat at 40.5 warp cycles per issued instruction with 23.9 of them, 58.9%, stalled on `Stall MIO Throttle`, the queue a warp waits in for a shared memory instruction to issue. This kernel runs at **21.0 warp cycles per issued instruction with MIO throttle down to 6.6 cycles, 31.4%**. The stall did not merely shrink in proportion to the loads removed; the whole issue pipeline got shorter.
+
 The occupancy table says the same thing from another direction. This kernel uses 48 registers per thread against kernel 4's 40, and at 512 threads per block that is 2 blocks per SM and 66.7% occupancy, identical to kernel 4's. We bought an extra 8 registers per thread and paid nothing for them.
 
-### What Is Still Wrong
+### What Could Be Improved
 
 The reuse is one sided. A thread reads a value of A once and uses it once; it reads a value of B once and uses it `TM` times. Written as a ratio, `1 + TM` loads feed `TM` FMAs, so as `TM` grows the loads per FMA approach 1 and stop there. Even at `TM = 64` every FMA would still cost roughly one shared memory read, because the A side never amortizes at all.
 

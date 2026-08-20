@@ -10,7 +10,7 @@ That is an outer product. The thread loads a short column vector from `As` and a
 
 The ratio is `(TM + TN) / (TM x TN)`, which falls as the patch grows, and that is the first place in this series where a knob exists that keeps paying. It is also the first knob with a real price, and the price is registers: those `TM x TN` accumulators live in registers for the entire lifetime of the kernel.
 
-### The Code
+### The Kernel
 
 The block tile doubles again in both dimensions, to `128 x 128`, and each thread produces an `8 x 8` patch, so the block needs `(128 x 128) / (8 x 8) = 256` threads. Note that the thread count is falling as the tiles grow, 1024 to 512 to 256, because the work per thread is rising faster than the tile is:
 
@@ -20,19 +20,19 @@ const int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
 dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
 dim3 blockDim((BM * BN) / (TM * TN));   // 256
 
-sgemm_register_2d_tiling<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+sgemm_register_tiling_2d<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 ```
 
 ```cuda
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void sgemm_register_2d_tiling(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+__global__ void sgemm_register_tiling_2d(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
   const int cRow = blockIdx.y;
   const int cCol = blockIdx.x;
 
   __shared__ float As[BM * BK];
   __shared__ float Bs[BK * BN];
 
-  const int numThreads = (BM * BN) / (TM * TN);
+  constexpr int NUM_THREADS = (BM * BN) / (TM * TN);
 
  const int threadCol = threadIdx.x % (BN / TN);
   const int threadRow = threadIdx.x / (BN / TN);
@@ -43,11 +43,11 @@ __global__ void sgemm_register_2d_tiling(int M, int N, int K, float alpha, const
 
   const int innerColA = threadIdx.x % BK;             
   const int innerRowA = threadIdx.x / BK;             
-  const int strideA = numThreads / BK;                
+  constexpr int ROW_STRIDE_A = NUM_THREADS / BK;                
 
   const int innerColB = threadIdx.x % BN;             
   const int innerRowB = threadIdx.x / BN;             
-  const int strideB = numThreads / BN;                
+  constexpr int ROW_STRIDE_B = NUM_THREADS / BN;                
 
   float threadResults[TM * TN] = {0.0f};
 
@@ -56,14 +56,14 @@ __global__ void sgemm_register_2d_tiling(int M, int N, int K, float alpha, const
 
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
 
-    for (int loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
-      As[(innerRowA + loadOffset) * BK + innerColA] =
-          A[(innerRowA + loadOffset) * K + innerColA];
+    for (int offset = 0; offset < BM; offset += ROW_STRIDE_A) {
+      As[(innerRowA + offset) * BK + innerColA] =
+          A[(innerRowA + offset) * K + innerColA];
     }
 
-    for (int loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
-      Bs[(innerRowB + loadOffset) * BN + innerColB] =
-          B[(innerRowB + loadOffset) * N + innerColB];
+    for (int offset = 0; offset < BK; offset += ROW_STRIDE_B) {
+      Bs[(innerRowB + offset) * BN + innerColB] =
+          B[(innerRowB + offset) * N + innerColB];
     }
     __syncthreads();
 
@@ -100,7 +100,7 @@ __global__ void sgemm_register_2d_tiling(int M, int N, int K, float alpha, const
 
 ### Mechanics
 
-1. **The loads need loops now, and that is a consequence of the arithmetic.** `As` holds `BM x BK = 1024` floats and there are only 256 threads, so each thread copies four elements rather than one. The loop steps by `strideA = numThreads / BK = 32`, which is how many complete rows of the A tile 256 threads cover in one pass, and it runs `BM / strideA = 4` times. `Bs` is also 1024 floats but its rows are 128 wide, so `strideB = numThreads / BN = 2` and the loop again runs four times over `BK = 8` rows. Both loops keep `innerCol` on the fast moving index, so every pass is still a fully coalesced global read.
+1. **The loads need loops now, and that is a consequence of the arithmetic.** `As` holds `BM x BK = 1024` floats and there are only 256 threads, so each thread copies four elements rather than one. The loop steps by `ROW_STRIDE_A = NUM_THREADS / BK = 32`, which is how many complete rows of the A tile 256 threads cover in one pass, and it runs `BM / ROW_STRIDE_A = 4` times. `Bs` is also 1024 floats but its rows are 128 wide, so `ROW_STRIDE_B = NUM_THREADS / BN = 2` and the loop again runs four times over `BK = 8` rows. Both loops keep `innerCol` on the fast moving index, so every pass is still a fully coalesced global read.
 
 2. **Three loops, and only the last one is arithmetic.** The `dotIdx` body is a load of `TM` values into `regM`, a load of `TN` values into `regN`, and then a `TM x TN` product grid. Splitting it this way is what makes the reuse explicit to the compiler: the two small loops are the only shared memory traffic in the kernel, and the nested pair underneath them touches registers exclusively. Fusing the loads into the product loops would read the same values `TM` and `TN` times over and undo the entire section.
 
@@ -147,13 +147,13 @@ This is the point in the series where "higher occupancy is better" has to be ret
 
 Register tiling deliberately trades the first mechanism for the second. Every kernel from here spends registers to buy independent work per thread, occupancy keeps falling, and performance keeps rising. The final kernel in this series runs at 16.7%.
 
-### What Is Still Wrong
+### What Could Be Improved
 
 The remaining shared memory reads are few, but each one is its own instruction. The inner loop issues 16 separate 32 bit `LDS` instructions per `dotIdx`, eight down a column of `As` and eight along a row of `Bs`, to feed 64 FMAs. The data volume is no longer the problem; the number of instructions carrying it is.
 
-That distinction has a name in the profiler. A warp waiting for a shared memory instruction to *issue*, rather than waiting for the data it asked for, shows up as `Stall MIO Throttle`, and it is what this kernel is expected to be dominated by. The fix does not move a single byte less. It moves the same bytes in a quarter of the instructions.
+That distinction has a name in the profiler, and the measurement is more interesting than a confirmation would have been. `Stall MIO Throttle` is a warp waiting for a shared memory instruction to *issue* rather than for the data it asked for, and it is what kernel 4 was drowning in: 23.9 of its 40.5 warp cycles per issued instruction, 58.9%. Kernel 5 cut that to 6.6 of 21.0, 31.4%. This kernel comes in at **7.49 warp cycles per issued instruction, and Nsight names no dominant stall reason for it at all**. Kernel 5's 31.4% was large enough to trip the rule; nothing here is.
 
-<!-- TODO: profiler numbers for kernel 6 to support the MIO claim.
-     `sudo ncu --section WarpStateStats ./bench 4096`, and smsp__inst_executed.sum
-     for the before number that kernel 7 quotes against. Counters are admin only
-     on this box right now. -->
+So MIO throttle is not what bounds this kernel, and the case for the next one does not rest on it. It rests on the count above. Sixteen `LDS` per `dotIdx` to feed 64 FMAs is a lot of issue slots spent carrying very little data, and issue slots are now the scarce resource. The fix does not move a single byte less. It moves the same bytes in a quarter of the instructions.
+
+<!-- TODO: smsp__inst_executed.sum on kernels 6 and 7, to state the instruction
+     reduction as measured rather than derived. WarpStateStats is done. -->

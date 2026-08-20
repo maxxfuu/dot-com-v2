@@ -1,6 +1,6 @@
 ## Vectorized Memory Access: 128-bit Loads and Stores
 
-Kernel 6 ended with a distinction that matters from here on. Its inner loop reads 16 floats out of shared memory to feed 64 FMAs, which is a small amount of data carried by a large number of instructions: eight separate 32 bit loads down a column of `As` and eight more along a row of `Bs`, every `dotIdx`, in every thread. A warp waiting for those to issue rather than for their data is stalled on `MIO Throttle`, and that is a queue for the load store pipe, not a bandwidth problem.
+Kernel 6 ended with a distinction that matters from here on. Its inner loop reads 16 floats out of shared memory to feed 64 FMAs, which is a small amount of data carried by a large number of instructions: eight separate 32 bit loads down a column of `As` and eight more along a row of `Bs`, every `dotIdx`, in every thread. A warp waiting for those to issue rather than for their data is stalled on `MIO Throttle`, and that is a queue for the load store pipe, not a bandwidth problem. Kernel 6 is no longer dominated by that stall (at 7.49 warp cycles per issued instruction, Nsight names no dominant reason for it), but the instruction count is real either way, and it is what this kernel removes.
 
 Nothing about the data needs to change. The GPU can move 128 bits in a single instruction, and a `float4` is exactly four contiguous floats, so if the four values a thread wants next to each other in memory really are next to each other, one `LDS.128` replaces four `LDS.32`. Same bytes, quarter the instructions, and the queue drains four times faster.
 
@@ -14,7 +14,7 @@ The fix is to store `As` transposed, as `BK` rows of `BM` floats instead of `BM`
 
 The transpose has to happen on the store side, not the load side, and that is the constraint the whole indexing scheme is built around. The read from global memory has to stay coalesced, which means a warp must read along a row of A, along the K dimension. So the thread reads four contiguous floats of A, then writes them into four different rows of `As`, one element each, scattering as it goes. We accept a scattered write into shared memory to preserve a contiguous read from global memory and to buy a contiguous read out of shared memory later. `Bs` needs none of this; it is already stored with `BN` as the fast dimension, which is the direction its readers want.
 
-### The Code
+### The Kernel
 
 The tile shape and thread count are unchanged from kernel 6, so this is a pure instruction level change with the same launch:
 
@@ -135,12 +135,12 @@ What changed is the instruction count carrying those bytes:
 
 Counted per output element, shared memory load instructions go from `K / 4` to `K / 16`, four times fewer, and the global side sees the same fourfold reduction in `LDG` and `STG` instructions for identical traffic. If a description of this kernel says vectorization moves less data, it is wrong. It moves precisely the same data with a quarter of the instructions, and the thing that was scarce was instruction issue.
 
-<!-- TODO: profiler callout for kernel 7. Needs `sudo ncu --section WarpStateStats
-     ./bench 4096` plus smsp__inst_executed.sum on kernels 6 and 7 to state the
-     instruction reduction as measured rather than derived, and MIO throttle
-     before and after. Counters are admin only on this box right now. -->
+Nsight puts numbers on the issue side of that. Kernel 6 runs at 7.49 warp cycles per issued instruction and this kernel at **6.37**, and neither has a stall reason large enough for the profiler to name one. The instruction count fell fourfold and the cost of issuing what remains fell with it.
 
-### What Is Still Wrong
+<!-- TODO: smsp__inst_executed.sum on kernels 6 and 7, to state the instruction
+     reduction as measured rather than derived. WarpStateStats is done. -->
+
+### What Could Be Improved
 
 The transpose bought the loads and quietly created a problem on the stores. Shared memory is divided into 32 banks by `(byte address / 4) mod 32`, and two lanes of the same warp hitting different addresses in the same bank serialize. The store is `As[(innerColA * 4 + j) * BM + innerRowA]`, and with `BM = 128`, which is a multiple of 32, the entire first term vanishes from the bank index. Every lane's bank is just `innerRowA mod 32`.
 

@@ -75,7 +75,7 @@ void tryConfig(const char *name) {
 
 1. **Every check is an assumption the kernel body makes, written down.** That is the useful way to read `cfg_valid()` and the useful way to write one: walk the kernel, and each time an expression assumes a division comes out whole, add the guard. Two of the checks are not legality at all but hard limits, the 48 KB static shared memory cap and the accumulator count above which spilling is certain. They belong in the same function because from the search's point of view "will not compile", "will corrupt memory" and "will spill and be useless" are the same answer.
 
-2. **`if constexpr` rather than `if`.** A plain runtime `if` would not help, because both branches of a runtime conditional are instantiated. `sgemm_warp_tiled<...>` would be compiled for the illegal config whether or not the branch ever executes, and it would either fail to compile or sit there ready to be called. `if constexpr` discards the untaken branch before instantiation, so an illegal tuple never becomes a kernel at all. The legality check and the compile become the same event.
+2. **`if constexpr` rather than `if`.** A plain runtime `if` would not help, because both branches of a runtime conditional are instantiated. `sgemm_warp_tiling<...>` would be compiled for the illegal config whether or not the branch ever executes, and it would either fail to compile or sit there ready to be called. `if constexpr` discards the untaken branch before instantiation, so an illegal tuple never becomes a kernel at all. The legality check and the compile become the same event.
 
 3. **The order of the checks matters.** Each guard protects the divisions in the guards below it, so `denom <= 0` is tested before anything divides by it and `WM % WMITER` is tested only after `WMITER` is known to be at least 1. A `constexpr` function evaluated at compile time will happily hand you a division by zero diagnostic if the checks are written out of order.
 
@@ -106,7 +106,7 @@ Three things fall out of that ranking. The winner is the non-square `128 x 64` w
 
 The last row deserves one more look. `256x128x16 ... 512t` has the largest block tile in the sweep, which by `K x (1/BM + 1/BN)` moves the least global traffic of anything here, and it finishes last by a wide margin. At 512 threads and 96 registers per thread it fits one block per SM, so it spends the entire kernel with nothing to switch to whenever it reaches a barrier.
 
-### What Is Still Wrong
+### What Could Be Improved
 
 A sweep hands back a configuration and no explanation. That is what it is for, but it means every kernel from here inherits a shape that was validated rather than derived, and it is worth being precise that the next sections optimize `128 x 64 x 16, W64x32, WNITER 2, 4 x 4, 128 threads` specifically rather than warp tiling in general. That distinction looks pedantic now. Four kernels from now it turns out to be the most important sentence in this section.
 

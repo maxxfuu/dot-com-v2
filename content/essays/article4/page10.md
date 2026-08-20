@@ -22,7 +22,7 @@ WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER)
 
 If that division does not come out whole, the config is not slow, it is wrong, and threads either overlap or leave holes in C. Nothing in this kernel checks it. The next section is about that.
 
-### The Code
+### The Kernel
 
 The config changes shape in a way worth flagging before the listing. The block tile is `128 x 64`, which is not square for the first time in the series, `BK` doubles to 16, the thread tile *shrinks* from `8 x 8` to `4 x 4`, and the block runs on 128 threads, one warp fewer than a quarter of kernel 7's:
 
@@ -40,7 +40,7 @@ Every one of those numbers came out of a search rather than an argument, which i
 ```cuda
 template <const int BM, const int BN, const int BK, const int WM, const int WN, const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
-sgemm_warp_tiled(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+sgemm_warp_tiling(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
   const int cRow = blockIdx.y;
   const int cCol = blockIdx.x;
 
@@ -66,11 +66,11 @@ sgemm_warp_tiled(int M, int N, int K, float alpha, const float *A, const float *
 
   const int innerRowA = threadIdx.x / (BK / 4);
   const int innerColA = threadIdx.x % (BK / 4);
-  const int rowStrideA = (NUM_THREADS * 4) / BK;
+  constexpr int ROW_STRIDE_A = (NUM_THREADS * 4) / BK;
 
   const int innerRowB = threadIdx.x / (BN / 4);
   const int innerColB = threadIdx.x % (BN / 4);
-  const int rowStrideB = NUM_THREADS / (BN / 4);
+  constexpr int ROW_STRIDE_B = NUM_THREADS / (BN / 4);
 
   float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
   float regM[WMITER * TM] = {0.0f};
@@ -78,7 +78,7 @@ sgemm_warp_tiled(int M, int N, int K, float alpha, const float *A, const float *
 
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
     
-    for (int offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
+    for (int offset = 0; offset + ROW_STRIDE_A <= BM; offset += ROW_STRIDE_A) {
       float4 tmp = reinterpret_cast<const float4 *>(
           &A[(innerRowA + offset) * K + innerColA * 4])[0];
       As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
@@ -86,7 +86,7 @@ sgemm_warp_tiled(int M, int N, int K, float alpha, const float *A, const float *
       As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
       As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
     }
-    for (int offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
+    for (int offset = 0; offset + ROW_STRIDE_B <= BK; offset += ROW_STRIDE_B) {
       reinterpret_cast<float4 *>(&Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
           reinterpret_cast<const float4 *>(&B[(innerRowB + offset) * N + innerColB * 4])[0];
     }
@@ -119,16 +119,16 @@ sgemm_warp_tiled(int M, int N, int K, float alpha, const float *A, const float *
 
   for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow) {
     for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol) {
-      float *C_sub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
+      float *cSub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
       for (int m = 0; m < TM; ++m) {
         for (int n = 0; n < TN; n += 4) {
-          float *cPtr = &C_sub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
+          float *cPtr = &cSub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
           float4 tmp = reinterpret_cast<float4 *>(cPtr)[0];
-          const int i = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
-          tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
-          tmp.y = alpha * threadResults[i + 1] + beta * tmp.y;
-          tmp.z = alpha * threadResults[i + 2] + beta * tmp.z;
-          tmp.w = alpha * threadResults[i + 3] + beta * tmp.w;
+          const int accIdx = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
+          tmp.x = alpha * threadResults[accIdx + 0] + beta * tmp.x;
+          tmp.y = alpha * threadResults[accIdx + 1] + beta * tmp.y;
+          tmp.z = alpha * threadResults[accIdx + 2] + beta * tmp.z;
+          tmp.w = alpha * threadResults[accIdx + 3] + beta * tmp.w;
           reinterpret_cast<float4 *>(cPtr)[0] = tmp;
         }
       }
@@ -143,7 +143,7 @@ sgemm_warp_tiled(int M, int N, int K, float alpha, const float *A, const float *
 
 2. **The accumulators are the same 64 as kernel 7, indexed differently.** `threadResults[WMITER * TM * WNITER * TN]` is `2 * 4 * 2 * 4 = 64` values, the same register footprint as an `8 x 8` patch, but laid out as four `4 x 4` patches scattered across the warp tile rather than one contiguous `8 x 8`. `ptxas` reports 96 registers per thread against kernel 7's 94, so the third level of tiling costs two registers.
 
-3. **The load loops come back, with different trip counts.** `rowStrideA = (NUM_THREADS * 4) / BK = 32`, and `BM / rowStrideA = 4` passes to fill `As`. `rowStrideB = NUM_THREADS / (BN / 4) = 8`, and `BK / rowStrideB = 2` passes for `Bs`. The loop bound is written `offset + rowStrideA <= BM` rather than `offset < BM`, which matters only when the stride does not divide the tile, and in that case it silently loads less than the full tile instead of overrunning it. That is a config bug rather than a runtime one, and again, nothing here checks.
+3. **The load loops come back, with different trip counts.** `ROW_STRIDE_A = (NUM_THREADS * 4) / BK = 32`, and `BM / ROW_STRIDE_A = 4` passes to fill `As`. `ROW_STRIDE_B = NUM_THREADS / (BN / 4) = 8`, and `BK / ROW_STRIDE_B = 2` passes for `Bs`. The loop bound is written `offset + ROW_STRIDE_A <= BM` rather than `offset < BM`, which matters only when the stride does not divide the tile, and in that case it silently loads less than the full tile instead of overrunning it. That is a config bug rather than a runtime one, and again, nothing here checks.
 
 4. **`__launch_bounds__` appears for the first time.** It promises the compiler that no more than `NUM_THREADS` threads will ever be launched in a block, which lets `ptxas` size the register allocation against a known block size. It is doing modest work here. In the final kernel, the second argument to this same declaration turns out to be the largest single win in the series.
 
@@ -167,6 +167,7 @@ This is worth sitting with, because the formula that says this config is bad is 
 
 - **Residency.** Kernel 7 ran 256 threads with 93 registers each, giving 2 blocks per SM and 33.3% occupancy. This kernel runs 128 threads with 96 registers, giving **5 blocks per SM** and 41.7%. Smaller blocks pack more of them onto an SM, and more resident blocks means the barriers cost less, because when one block stalls at `__syncthreads()` there are four others with work to issue.
 - **Warp locality.** Each shared memory instruction now touches a 16 or 32 float range instead of a 128 float one, which was the entire point of the section.
+- **Issue pressure.** Nsight puts this kernel at 7.08 warp cycles per issued instruction, and for the first time in the series the largest stall reason it names is `Stall Not Selected`, at 38.1%: warps that were eligible and simply were not picked that cycle. That is what having enough work looks like, and every kernel from here shares the signature.
 - **L2.** The extra 2.15 GB of requests is only expensive if it reaches DRAM, and on this card it does not have to. A block row band of A is `BM x K x 4 = 2 MB`, and the L2 is 64 MB.
 
 That last point deserves a number, because it is where the roofline stops being useful.
@@ -182,7 +183,7 @@ The kernel beats its own roofline in both forms, and by now the reason is famili
 
 That is the third and final time this model earns its keep in the series, and it earns it by failing. It was the right tool at kernel 1, where it explained a 234 times intensity deficit; it was the right tool at kernel 4, where the kernel first sat underneath it; and it is the wrong tool from here on, because every remaining bottleneck is inside the SM. The traffic accounting that would still be informative is against L2 rather than DRAM, and `lts__t_sector_hit_rate.pct` is the metric that would settle it.
 
-### What Is Still Wrong
+### What Could Be Improved
 
 There is nothing wrong with this kernel that a better argument would fix, which is precisely the problem.
 

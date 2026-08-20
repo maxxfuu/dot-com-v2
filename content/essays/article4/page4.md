@@ -18,7 +18,7 @@ With the coalesced kernel for matrix B, all 32 threads read the same row of B du
 
 ![Left: the naive mapping takes col from threadIdx.y, so all 32 lanes of a warp resolve to the same column of B - one address, one 32 B sector loaded, 4 B of it used and the rest of the warp served by broadcast, and each k step walks one row down that same column. Right: taking col from threadIdx.x puts the 32 lanes on 32 adjacent columns of row k - 128 contiguous bytes packed into 4 x 32 B sectors with every byte used, and the whole warp drops one row per k step.](/images/gemm/coalescing-matrix-b.png "large")
 
-### The Code
+### The Kernel
 
 The launch configuration is unchanged from kernel 1. It is `32 x 32` threads per block, one thread per output element, `CEIL_DIV(N, 32) x CEIL_DIV(M, 32)` blocks:
 
@@ -70,7 +70,7 @@ Naive, each lane claims its own 32 byte sector for a single 4 byte value: 32 sec
 
 ![Naive: one 32 B sector per lane, 1 of 8 slots used. 32 sectors x 32 B = 1024 B moved, only 128 B used, 12.5% efficiency. Coalesced: one 32 B sector per 8 lanes, all 8 slots used. 4 sectors x 32 B = 128 B moved, all 128 B used, 100% efficiency.](/images/gemm/sector-utilization.png "large")
 
-### What Is Still Wrong
+### What Could Be Improved
 
 The main difference between the naive kernel implementation and the coalesced kernel is that the coalesced version reduces the total hardware transaction making the kernel 7.1% times faster than the naive kernel. But the catch is that the total work done the byte is still the same; the algorithmic workload hasn't changed. To compute one cell in matrix C, we are still doing a `2K` load just to perform the mulitplication and addition to create the dot product.
 

@@ -35,12 +35,12 @@ Worth noticing that this got worse as the kernel got better. At kernel 7's `BK =
 If the row stride is a multiple of 32 the column term disappears, so make it not a multiple of 32. Pad each row of `As` by a couple of floats, leaving a small hole at the end of every row, and the column term comes back into the bank index:
 
 ```cuda
-constexpr int ASTRIDE = BM + (32 / BK) % 8;   // 128 + 2 = 130
+constexpr int A_STRIDE = BM + (32 / BK) % 8;   // 128 + 2 = 130
 
-__shared__ float As[BK * ASTRIDE];
+__shared__ float As[BK * A_STRIDE];
 ```
 
-With `ASTRIDE = 130` and `130 mod 32 = 2`:
+With `A_STRIDE = 130` and `130 mod 32 = 2`:
 
 ``` latex
 \text{bank} = \big((\text{innerColA} \cdot 4 + j) \cdot 130 + \text{innerRowA}\big) \bmod 32 = \big(2(\text{innerColA} \cdot 4 + j) + \text{innerRowA}\big) \bmod 32
@@ -48,7 +48,7 @@ With `ASTRIDE = 130` and `130 mod 32 = 2`:
 
 Within a warp `innerColA = threadIdx.x % 4` takes the values 0 through 3, so for a fixed `j` the column term takes the four values `{2j, 8 + 2j, 16 + 2j, 24 + 2j}`, and each of those is offset by one of the 8 values of `innerRowA`. Four groups of eight, 32 distinct banks, no two lanes colliding. The conflict is gone.
 
-The rest of the kernel is kernel 8 with `BM` replaced by `ASTRIDE` in the three places that index `As`, plus the extra 128 bytes of shared memory per block that the padding costs.
+The rest of the kernel is kernel 8 with `BM` replaced by `A_STRIDE` in the three places that index `As`, plus the extra 128 bytes of shared memory per block that the padding costs.
 
 ```cuda
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
@@ -58,9 +58,9 @@ sgemm_padded_smem(int M, int N, int K, float alpha, const float *A, const float 
   const int cRow = blockIdx.y;
   const int cCol = blockIdx.x;
 
-  constexpr int ASTRIDE = BM + (32 / BK) % 8;
+  constexpr int A_STRIDE = BM + (32 / BK) % 8;
 
-  __shared__ float As[BK * ASTRIDE];
+  __shared__ float As[BK * A_STRIDE];
   __shared__ float Bs[BK * BN];
 
   const int warpIdx = threadIdx.x / WARPSIZE;
@@ -81,27 +81,27 @@ sgemm_padded_smem(int M, int N, int K, float alpha, const float *A, const float 
 
   const int innerRowA = threadIdx.x / (BK / 4);
   const int innerColA = threadIdx.x % (BK / 4);
-  const int rowStrideA = (NUM_THREADS * 4) / BK;
+  constexpr int ROW_STRIDE_A = (NUM_THREADS * 4) / BK;
 
   const int innerRowB = threadIdx.x / (BN / 4);
   const int innerColB = threadIdx.x % (BN / 4);
-  const int rowStrideB = NUM_THREADS / (BN / 4);
+  constexpr int ROW_STRIDE_B = NUM_THREADS / (BN / 4);
 
   float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
   float regM[WMITER * TM] = {0.0f};
   float regN[WNITER * TN] = {0.0f};
 
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    for (int offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
+    for (int offset = 0; offset + ROW_STRIDE_A <= BM; offset += ROW_STRIDE_A) {
       float4 tmp = reinterpret_cast<const float4 *>(
           &A[(innerRowA + offset) * K + innerColA * 4])[0];
-      As[(innerColA * 4 + 0) * ASTRIDE + innerRowA + offset] = tmp.x;
-      As[(innerColA * 4 + 1) * ASTRIDE + innerRowA + offset] = tmp.y;
-      As[(innerColA * 4 + 2) * ASTRIDE + innerRowA + offset] = tmp.z;
-      As[(innerColA * 4 + 3) * ASTRIDE + innerRowA + offset] = tmp.w;
+      As[(innerColA * 4 + 0) * A_STRIDE + innerRowA + offset] = tmp.x;
+      As[(innerColA * 4 + 1) * A_STRIDE + innerRowA + offset] = tmp.y;
+      As[(innerColA * 4 + 2) * A_STRIDE + innerRowA + offset] = tmp.z;
+      As[(innerColA * 4 + 3) * A_STRIDE + innerRowA + offset] = tmp.w;
     }
 
-    for (int offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
+    for (int offset = 0; offset + ROW_STRIDE_B <= BK; offset += ROW_STRIDE_B) {
       reinterpret_cast<float4 *>(&Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
           reinterpret_cast<const float4 *>(&B[(innerRowB + offset) * N + innerColB * 4])[0];
     }
@@ -114,7 +114,7 @@ sgemm_padded_smem(int M, int N, int K, float alpha, const float *A, const float 
       for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow)
         for (int i = 0; i < TM; ++i)
           regM[wSubRow * TM + i] =
-              As[dotIdx * ASTRIDE + warpRow * WM + wSubRow * WSUBM + threadRowInWarp * TM + i];
+              As[dotIdx * A_STRIDE + warpRow * WM + wSubRow * WSUBM + threadRowInWarp * TM + i];
 
       for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol)
         for (int i = 0; i < TN; ++i)
@@ -133,16 +133,16 @@ sgemm_padded_smem(int M, int N, int K, float alpha, const float *A, const float 
 
   for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow) {
     for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol) {
-      float *C_sub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
+      float *cSub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
       for (int m = 0; m < TM; ++m) {
         for (int n = 0; n < TN; n += 4) {
-          float *cPtr = &C_sub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
+          float *cPtr = &cSub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
           float4 tmp = reinterpret_cast<float4 *>(cPtr)[0];
-          const int i = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
-          tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
-          tmp.y = alpha * threadResults[i + 1] + beta * tmp.y;
-          tmp.z = alpha * threadResults[i + 2] + beta * tmp.z;
-          tmp.w = alpha * threadResults[i + 3] + beta * tmp.w;
+          const int accIdx = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
+          tmp.x = alpha * threadResults[accIdx + 0] + beta * tmp.x;
+          tmp.y = alpha * threadResults[accIdx + 1] + beta * tmp.y;
+          tmp.z = alpha * threadResults[accIdx + 2] + beta * tmp.z;
+          tmp.w = alpha * threadResults[accIdx + 3] + beta * tmp.w;
           reinterpret_cast<float4 *>(cPtr)[0] = tmp;
         }
       }
@@ -157,7 +157,7 @@ sgemm_padded_smem(int M, int N, int K, float alpha, const float *A, const float 
 
 2. **Padding costs shared memory and nothing else.** `As` goes from `BK x BM x 4 = 8192` bytes to `BK x 130 x 4 = 8320`, so the block total goes from 12288 to 12416 bytes. At 5 blocks per SM that is still far inside the 100 KB budget, and `ptxas` reports 94 registers against kernel 8's 96, so residency stays at 5 blocks per SM and occupancy stays at 41.7%. Nothing was traded away for this.
 
-3. **Only the store was conflicted, and the loads were already fine.** `regM` reads `As[dotIdx * ASTRIDE + ...]` over consecutive `i`, which are consecutive floats and therefore consecutive banks. This is worth saying out loud, because it is both the reason the fix is cheap and, as the next paragraphs show, the reason the fix does not pay. The load path runs six times more often than the store path and was never what needed fixing.
+3. **Only the store was conflicted, and the loads were already fine.** `regM` reads `As[dotIdx * A_STRIDE + ...]` over consecutive `i`, which are consecutive floats and therefore consecutive banks. This is worth saying out loud, because it is both the reason the fix is cheap and, as the next paragraphs show, the reason the fix does not pay. The load path runs six times more often than the store path and was never what needed fixing.
 
 Kernel 10 runs in **4.660 ms at 29490.7 GFLOP/s, which is 81.9% of cuBLAS at `M = N = K = 4096`**, against 4.679 ms and 81.6% for kernel 8. That is a gain of **0.4%**.
 
@@ -188,7 +188,7 @@ The general lesson is about how to read a profiler. It reports where time goes i
 
 Keep the derivation anyway. It is correct, it is the only place in this series where a hardware detail as small as a bank index reaches into a line of code, and padding is the right default for a transposed shared memory buffer. It is also, as the final section of this article discovers, a fix with an expiry date.
 
-### What Is Still Wrong
+### What Could Be Improved
 
 The instruction table says something else worth reading twice. `FFMA` is 95% of what this kernel issues per K-tile, and around 83% of everything it executes once loop overhead and the epilogue are counted. There is essentially no overhead left to remove. Every instruction that is not arithmetic has been hoisted, vectorized, tiled or padded away across the last five kernels.
 
