@@ -1,11 +1,16 @@
 import type { Metadata } from "next";
 import { createPageMetadata } from "@/lib/metadata";
 
-export const metadata: Metadata = createPageMetadata({
-  title: "Resume",
-  description: "Max Fu's resume.",
-  path: "/resume",
-});
+// Not linked anywhere in the site nav — it stays reachable at /resume for
+// direct sharing, but is kept out of search indexes.
+export const metadata: Metadata = {
+  ...createPageMetadata({
+    title: "Resume",
+    description: "Max Fu's resume.",
+    path: "/resume",
+  }),
+  robots: { index: false, follow: false },
+};
 
 export default function ResumePage() {
   return (
