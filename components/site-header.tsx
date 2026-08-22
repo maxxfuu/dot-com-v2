@@ -11,7 +11,7 @@ export function SiteHeader() {
   const pathname = usePathname();
   const isHome = pathname === "/";
   const isEssays = pathname.startsWith("/essays");
-  const isResume = pathname === "/resume";
+  const isResources = pathname === "/resources";
   const isProjects = pathname === "/projects";
 
   return (
@@ -37,16 +37,16 @@ export function SiteHeader() {
           {navLabel(isEssays, "essays")}
         </Link>
         <Link
-          href="/resume"
-          className={isResume ? "text-foreground" : "transition-colors hover:text-foreground"}
-        >
-          {navLabel(isResume, "resume")}
-        </Link>
-        <Link
           href="/projects"
           className={isProjects ? "text-foreground" : "transition-colors hover:text-foreground"}
         >
           {navLabel(isProjects, "projects")}
+        </Link>
+        <Link
+          href="/resources"
+          className={isResources ? "text-foreground" : "transition-colors hover:text-foreground"}
+        >
+          {navLabel(isResources, "resources")}
         </Link>
       </nav>
     </header>
