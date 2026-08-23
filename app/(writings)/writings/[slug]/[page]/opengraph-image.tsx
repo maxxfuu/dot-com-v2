@@ -3,7 +3,7 @@ import {
   essayOgContentType,
   essayOgSize,
   renderEssayOgImage,
-} from "@/app/(essays)/essays/components/essay-og";
+} from "@/app/(writings)/writings/components/essay-og";
 import { getBlogPosts } from "@/lib/blog";
 
 export const alt = essayOgAlt;

@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound, redirect } from "next/navigation";
-import { EssayArticle } from "@/app/(essays)/essays/components/essay-article";
+import { EssayArticle } from "@/app/(writings)/writings/components/essay-article";
 import { getBlogPost, getBlogPosts, getSeriesFirstPage } from "@/lib/blog";
 import { createPageMetadata } from "@/lib/metadata";
 
@@ -41,7 +41,7 @@ export default async function BlogPostPage({ params }: BlogPostPageProps) {
   const post = await getBlogPost(slug);
 
   if (!post) {
-    // A bare series slug (e.g. /essays/article4) lands on its first page.
+    // A bare series slug (e.g. /writings/article4) lands on its first page.
     const seriesFirstPage = await getSeriesFirstPage(slug);
 
     if (seriesFirstPage) {

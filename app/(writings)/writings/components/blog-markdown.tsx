@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Fragment } from "react";
 import Link from "next/link";
 import katex from "katex";
-import { CheckUnderstanding } from "@/app/(essays)/essays/components/check-understanding";
+import { CheckUnderstanding } from "@/app/(writings)/writings/components/check-understanding";
 import { ZoomableImage } from "@/components/zoomable-image";
 import { getHighlighter, highlightCode } from "@/lib/highlight";
 

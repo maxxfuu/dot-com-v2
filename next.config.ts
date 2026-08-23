@@ -5,7 +5,17 @@ const nextConfig: NextConfig = {
     return [
       {
         source: "/essays/:year(\\d{4})/:slug",
-        destination: "/essays/:slug",
+        destination: "/writings/:slug",
+        permanent: true,
+      },
+      {
+        source: "/essays",
+        destination: "/writings",
+        permanent: true,
+      },
+      {
+        source: "/essays/:path*",
+        destination: "/writings/:path*",
         permanent: true,
       },
     ];

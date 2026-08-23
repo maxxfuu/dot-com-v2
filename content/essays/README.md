@@ -37,7 +37,7 @@ Both caps apply and the tighter one wins, so aspect ratio is always preserved.
 `full` does stretch to the column, so only use it on an image wide enough to
 take it (roughly 1500px or more to stay sharp on a high-DPI screen). Change the
 numbers behind these names in `figureSizes` in
-`app/(essays)/essays/components/blog-markdown.tsx` and every image follows.
+`app/(writings)/writings/components/blog-markdown.tsx` and every image follows.
 
 Clicking any image opens it full size, so a diagram can be small in the page and
 still readable.

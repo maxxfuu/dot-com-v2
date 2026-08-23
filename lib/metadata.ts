@@ -9,7 +9,7 @@ export const defaultDescription =
 // why sharing the site (e.g. in iMessage) showed the favicon as the card image.
 // Open Graph images are now generated dynamically via file-based
 // `opengraph-image` routes (app/opengraph-image.tsx for the site default and
-// app/(essays)/essays/[slug]/opengraph-image.tsx per essay).
+// app/(writings)/writings/[slug]/opengraph-image.tsx per essay).
 // const defaultOgImage = {
 //   url: "/favicon.ico",
 //   width: 1200,

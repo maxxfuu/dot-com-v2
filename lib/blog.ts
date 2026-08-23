@@ -98,7 +98,7 @@ export async function getBlogPosts(): Promise<BlogPost[]> {
         date: String(metadata.date ?? "1970-01-01"),
         summary: String(metadata.summary ?? ""),
         body,
-        href: `/essays/${slug}`,
+        href: `/writings/${slug}`,
         series,
         pageNumber: pageNumberMatch ? Number(pageNumberMatch[1]) : null,
         // Only the first page of a series carries frontmatter; later pages

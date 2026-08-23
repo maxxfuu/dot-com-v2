@@ -17,7 +17,7 @@ export function Navbar() {
         <Link href="/" className="text-sm font-bold">me@maxxfuu.com</Link>
         <ul className="flex flex-row items-center space-x-4">
           <li>
-            <Link href="/essays" className="text-sm">essays</Link>
+            <Link href="/writings" className="text-sm">essays</Link>
           </li>
           <li>
             <Link href="/resume.pdf" target="_blank" className="text-sm">resume</Link>

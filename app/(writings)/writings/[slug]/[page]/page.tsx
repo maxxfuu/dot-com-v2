@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { EssayArticle } from "@/app/(essays)/essays/components/essay-article";
+import { EssayArticle } from "@/app/(writings)/writings/components/essay-article";
 import { getBlogPost, getBlogPosts } from "@/lib/blog";
 import { createPageMetadata } from "@/lib/metadata";
 

@@ -25,19 +25,19 @@ Its all about the memory hierachy and the movement of data with the CUDA softwar
 Below is the table of contents, feel free to skip around although reading this sequentially is advised. 
 
 ### To write a CUDA Matmul Kernel That Reaches 97% of cuBLAS Performance
-1. [From CUDA Hardware Architecture to CUDA Kernels](/essays/article4/page2)
-2. [The Naive Kernel: Establishing a Baseline](/essays/article4/page3)
-3. [Global Memory Coalescing](/essays/article4/page4)
-4. [Flattening the Block](/essays/article4/page5)
-5. [Shared Memory Tiling](/essays/article4/page6)
-6. [1D Register Tiling: One Thread, TM Outputs](/essays/article4/page7)
-7. [2D Register Tiling: The Outer Product](/essays/article4/page8)
-8. [Vectorized Memory Access: 128-bit Loads and Stores](/essays/article4/page9)
-9. [Warp Tiling: A Third Level of Tiling](/essays/article4/page10)
-10. [Autotuning: Searching the Tile-Shape Space](/essays/article4/page11)
-11. [Padded Shared Memory: Eliminating Bank Conflicts](/essays/article4/page12)
-12. [Double Buffering: Software Pipelining the K-Loop](/essays/article4/page13)
-13. [The Final Kernel: Retuning Against the Pipeline](/essays/article4/page14)
+1. [From CUDA Hardware Architecture to CUDA Kernels](/writings/article4/page2)
+2. [The Naive Kernel: Establishing a Baseline](/writings/article4/page3)
+3. [Global Memory Coalescing](/writings/article4/page4)
+4. [Flattening the Block](/writings/article4/page5)
+5. [Shared Memory Tiling](/writings/article4/page6)
+6. [1D Register Tiling: One Thread, TM Outputs](/writings/article4/page7)
+7. [2D Register Tiling: The Outer Product](/writings/article4/page8)
+8. [Vectorized Memory Access: 128-bit Loads and Stores](/writings/article4/page9)
+9. [Warp Tiling: A Third Level of Tiling](/writings/article4/page10)
+10. [Autotuning: Searching the Tile-Shape Space](/writings/article4/page11)
+11. [Padded Shared Memory: Eliminating Bank Conflicts](/writings/article4/page12)
+12. [Double Buffering: Software Pipelining the K-Loop](/writings/article4/page13)
+13. [The Final Kernel: Retuning Against the Pipeline](/writings/article4/page14)
 
 
 This writing was inspired by blogs such as Simons writing on this exact topic[^1]. Abhik's[^2] and Robert's[^3] on this topic is what cemented these concepts for me. The reset of my knowledge gap was filed with reading PMPP [^4], Modals' GPU Glossary[^5], and a lot of tokens.

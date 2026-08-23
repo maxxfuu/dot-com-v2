@@ -4,9 +4,9 @@ import { formatBlogDate, getEssayIndex } from "@/lib/blog";
 import { createPageMetadata } from "@/lib/metadata";
 
 export const metadata: Metadata = createPageMetadata({
-  title: "Essays",
+  title: "Writings",
   description: "A collection of my literary atrocities on my interests, passions, and experiences...",
-  path: "/essays",
+  path: "/writings",
 });
 
 export default async function Essays() {
@@ -16,7 +16,7 @@ export default async function Essays() {
     <main className="mx-auto max-w-2xl px-6 pb-24 pt-12 md:px-10 md:pt-16">
       <header className="mb-20 text-center">
         <h1 className="text-4xl font-normal leading-tight tracking-tight md:text-5xl">
-          Essays
+          Writings
         </h1>
         <p className="mx-auto mt-5 max-w-lg font-sans text-sm leading-relaxed text-muted-foreground">
           A collection of my literary atrocities on my interests, passions, and experiences.

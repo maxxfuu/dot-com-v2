@@ -10,7 +10,7 @@ function navLabel(active: boolean, label: string) {
 export function SiteHeader() {
   const pathname = usePathname();
   const isHome = pathname === "/";
-  const isEssays = pathname.startsWith("/essays");
+  const isWritings = pathname.startsWith("/writings");
   const isResources = pathname === "/resources";
   const isProjects = pathname === "/projects";
 
@@ -28,13 +28,13 @@ export function SiteHeader() {
           href="/"
           className={isHome ? "text-foreground" : "transition-colors hover:text-foreground"}
         >
-          {navLabel(isHome, "home")}
+          {navLabel(isHome, "about")}
         </Link>
         <Link
-          href="/essays"
-          className={isEssays ? "text-foreground" : "transition-colors hover:text-foreground"}
+          href="/writings"
+          className={isWritings ? "text-foreground" : "transition-colors hover:text-foreground"}
         >
-          {navLabel(isEssays, "essays")}
+          {navLabel(isWritings, "writings")}
         </Link>
         <Link
           href="/projects"

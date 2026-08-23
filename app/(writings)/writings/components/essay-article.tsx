@@ -1,6 +1,6 @@
 import Link from "next/link";
-import { BlogMarkdown } from "@/app/(essays)/essays/components/blog-markdown";
-import { SeriesPager } from "@/app/(essays)/essays/components/series-pager";
+import { BlogMarkdown } from "@/app/(writings)/writings/components/blog-markdown";
+import { SeriesPager } from "@/app/(writings)/writings/components/series-pager";
 import { formatBlogDate, getSeriesNav, type BlogPost } from "@/lib/blog";
 import { ArrowLeftIcon } from "lucide-react";
 
@@ -13,7 +13,7 @@ export async function EssayArticle({ post }: { post: BlogPost }) {
   return (
     <main className="mx-auto max-w-3xl px-6 pb-24 pt-12 md:px-10 md:pt-16">
       <div className="mb-16 font-sans text-sm">
-        <Link href="/essays" className="text-muted-foreground transition-opacity hover:text-foreground flex items-center gap-2">
+        <Link href="/writings" className="text-muted-foreground transition-opacity hover:text-foreground flex items-center gap-2">
           <ArrowLeftIcon className="w-4 h-4" /> back
         </Link>
       </div>

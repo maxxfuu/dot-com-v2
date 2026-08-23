@@ -56,8 +56,8 @@ export default function Page() {
             find in it.
           </p>
         </div>
-        <Link href="/essays" className="text-sm text-foreground transition-opacity hover:text-foreground flex items-center justify-end gap-2 mb-8">
-          Essays 
+        <Link href="/writings" className="text-sm text-foreground transition-opacity hover:text-foreground flex items-center justify-end gap-2 mb-8">
+          Writings 
           <ArrowRightIcon className="w-4 h-4" />
         </Link>
         <Separator />
