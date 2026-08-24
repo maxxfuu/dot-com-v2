@@ -100,7 +100,7 @@ We reduced the loads per cell from 8192 to 256. This is a decrease of global mem
 
 The shared memory tiling kernel moves the arithmetic intensity based on the roofline model. The previous intensity of `0.25` moves to `8 FLOP/byte`. This is a `32` times increase. However, it's still `7.3` times short of the theoretical ridge point based on the RTX 5080. 
 
-![The same RTX 5080 roofline as before, with the naive kernel sitting at an arithmetic intensity of 0.25 FLOP/byte and 0.24 TFLOP/s. Shared memory tiling moves the kernel 32 times to the right along the 960 GB/s slope, to 8 FLOP/byte, and the attainable performance climbs with it. It is still on the sloped part of the roof: the ridge point is at 58.6 FLOP/byte, so the kernel is 7.3 times short of the intensity it would need to leave the memory bound region and hit the 56.3 TFLOP/s FP32 ceiling.](/images/gemm/roofline-smem-tiling.png "full")
+![insert image here](/images/gemm/roofline-smem-tiling.png "full")
 
 ### What Could Be Improved
 
