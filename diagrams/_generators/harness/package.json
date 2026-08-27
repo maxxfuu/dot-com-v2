@@ -1,0 +1,12 @@
+{
+  "name": "excalidraw-diagram-harness",
+  "private": true,
+  "description": "Normalises text metrics in .excalidraw scenes and renders them to PNG for visual diffing.",
+  "dependencies": {
+    "@excalidraw/excalidraw": "0.18.0",
+    "esbuild": "^0.25.0",
+    "playwright-core": "^1.50.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}
