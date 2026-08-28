@@ -25,57 +25,69 @@ dim3 blockDim((BM * BN) / TM);   // 512
 sgemm_register_tiling_1d<BM, BN, BK, TM><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 ```
 
-```cuda
-template <const int BM, const int BN, const int BK, const int TM>
-__global__ void sgemm_register_tiling_1d(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+``` cuda 
+#include <cuda_runtime.h>
 
-  const int cRow = blockIdx.y;
-  const int cCol = blockIdx.x;
+// Template accepts block dimensions followed by a thread mulitiplier
+template <const int block_M, const int block_N, const int block_K, const int thread_multiplier>
+__global__ void sgemm_1d_register_tiling(int M, int N, int K, float alpha, float beta, float *A, float *B, float *C) {
+  const int C_Row = blockIdx.y;
+  const int C_Col = blockIdx.x;
 
-  __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+  // shared memory allocation
+  __shared__ float A_smem[block_M * block_K];
+  __shared__ float B_smem[block_K * block_N];
 
-  
-  
-  const int threadCol = threadIdx.x % BN;
-  const int threadRow = threadIdx.x / BN;
+  // Set pointer at top left coner of the block tile
+  A += C_Row * block_M * K;
+  B += C_Col * block_N;
+  C += C_Row * block_M * N * C_Col * block_N;
 
-  A += cRow * BM * K;                   
-  B += cCol * BN;                       
-  C += cRow * BM * N + cCol * BN;       
+  // calculate coordinates for computation within the block tile
+  const int thread_col = threadIdx.x % block_N;
+  const int thread_row = threadIdx.x % block_N;
 
-  const int innerColA = threadIdx.x % BK;  
-  const int innerRowA = threadIdx.x / BK;  
-                                           
-  const int innerColB = threadIdx.x % BN;  
-  const int innerRowB = threadIdx.x / BN;  
+  // calculate coordinates for block tile
+  const int inner_col_A = threadIdx.x % block_K;
+  const int inner_row_A = threadIdx.x / block_K;
 
-  float threadResults[TM] = {0.0f};
+  const int inner_col_B = threadIdx.x % block_N;
+  const int inner_row_B = threadIdx.x / block_N;
 
-  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    
-    As[innerRowA * BK + innerColA] = A[innerRowA * K + innerColA];
-    Bs[innerRowB * BN + innerColB] = B[innerRowB * N + innerColB];
+  // static array allocated within the on-chip registers
+  float thread_results[thread_multiplier] = {0.0f};
+
+  for (int block_idx = 0; block_idx < K; block_idx += block_K) {
+    // load data from global memory into shared memory
+    A_smem[inner_row_A * block_K + inner_col_A] = A[inner_row_A * K + inner_col_A];
+    B_smem[inner_row_B * block_K + inner_col_B] = B[inner_row_B * K + inner_col_B];
+
     __syncthreads();
 
-    A += BK;
-    B += BK * N;
+    // advance global pointers to the next block iteration
+    A += block_K;
+    B += block_K * N;
 
-    for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
-      float regN = Bs[dotIdx * BN + threadCol]; 
-      for (int resIdx = 0; resIdx < TM; ++resIdx) {
-        threadResults[resIdx] += As[(threadRow * TM + resIdx) * BK + dotIdx] * regN;
+    // compute thread_multiplier elelments per thread
+    for (int dot_product_idx = 0; dot_product_idx < block_K; ++dot_product_idx) {
+      // load one temporary B element into a register per iteration
+      float temp_B = B_smem[dot_product_idx * block_N + thread_col];
+
+      for (int res_idx = 0; res_idx < thread_multiplier; ++res_idx) {
+        thread_results[res_idx] += A_smem[(thread_row * thread_multiplier + res_idx) * block_K + dot_product_idx] * temp_B;
       }
     }
+
     __syncthreads();
   }
 
-  for (int resIdx = 0; resIdx < TM; ++resIdx) {
-    C[(threadRow * TM + resIdx) * N + threadCol] =
-        alpha * threadResults[resIdx] +
-        beta * C[(threadRow * TM + resIdx) * N + threadCol];
+  for (int res_idx = 0; res_idx < thread_multiplier; ++res_idx) {
+    C[(thread_row * thread_multiplier + res_idx) * N + thread_col] =
+        alpha * thread_results[res_idx] +
+        beta * C[(thread_row * thread_multiplier + res_idx) * N + thread_col];
   }
 }
+
 ```
 
 ### Mechanics
