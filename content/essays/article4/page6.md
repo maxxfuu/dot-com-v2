@@ -1,14 +1,17 @@
 ## Shared Memory Tiling
 
-The coalesced kernel loads data more efficiently by reducing the number of hardware transactions. For Matrix B, you packed the memory such that each thread accesses memory in a sequential and adjacent manner, so the hardware only needs 4 transactions instead of 32 to serve the whole warp. For Matrix A, you optimized it so that all 32 threads access the same element, bringing the load down to a single transaction, which gets broadcasted to all 32 lanes/registers. 
+In the previous chapter, we concluded that the coalesced kernel loads data more efficiently by reducing the number of hardware transactions. From the perspective of Matrix B, you pack the memory such that each thread accesses memory in a row major fashion where each thread accesses the matrix in a sequential and adjacent manner; so the hardware only needs 4 transactions instead of 32 to serve the whole warp. And from the persepctive of Matrix A, you optimized it so that all 32 threads access the same data, bringing the load down to a single transaction, which gets broadcasted to all 32 lanes/registers. 
 
-Global memory coalescing optimizes on the thread level, however we can optimize the kernel even more. If you take a step back and view the kernel from a warp level, you will be able to spot the redundancies that can further optimized. 
+You should by now realize that global memory coalescing optimizes on the thread level, however we can optimize the kernel even further. If you take a step back and view the kernel from a warp level, you will be able to spot the redundancies that allows further optimizations. 
 
-The whole premise of the shared memory tiling technique is to move a tile size data to the shared memory thats located on the SM. This is because accessing global memory takes longer than accessing shared memory, and since a lot of data is being resued, we can temporarily store the data inside the shared memory for faster access.
+The whole premise of the shared memory tiling technique that is introduced in this chapter is to move a block size matrix, (`BLOCKSIZE * BLOCKSIZE`), to the shared memory thats located on the SM. This is because accessing global memory takes longer than accessing shared memory, and since a lot of data is being resued, we can temporarily store the data inside the shared memory for faster access.
 
 Looking at matrix B as a whole, understand that each row corresponds to a whole warp. And each warp accesses the same coalesced data within B. Warp 0 needs 32 floats that span `B[k][0-31]`, warp 1 needs 32 floats that also span `B[k][0-31]`, and all 32 warps need the same 32 floats. Therefore 32 distinct warps hits the L1 cache asking for the same 128 bytes, which makes the hardware execute 32 redundant reads for data that has already been fetched by another warp. 
 
-Matrix A's inefficiency is a little tougher to spot. The warps load different data since each warp corresponds to a new row. Warp 0 needs `A[0][k]`, warp 1 needs `A[1][k]`, and warp 2 needs `A[2][k]`. So collectively, all the warps during one lockstep reads down a whole column `A[0-31][k]`. Therefore you have 32 independent warps accessing strided memory within the VRAM. Even though global memory coalescing broadcasts the data between all of the threads, this optmization only exists within the scope of a warp. So whole block contains 32 warps that generates 32 uncoalesced transactions such that each wrap fetches one byte sector for a single lockstep. 
+Matrix A's inefficiency is a little tougher to spot. The warps load different data since each warp corresponds to a new row. Warp 0 needs `A[0][k]`, warp 1 needs `A[1][k]`, and warp 2 needs `A[2][k]`. So collectively, all the warps during one lockstep reads down a whole column `A[0-31][k]`. Therefore you have 32 independent warps accessing strided memory within the VRAM. Even though global memory coalescing broadcasts the data between all of the threads, this optmization only exists within the scope of a warp. 
+
+
+So whole block contains 32 warps that generates 32 uncoalesced transactions such that each wrap fetches one byte sector for a single lockstep. 
 
 Shared Memory Tiling fixes both problems in two different ways: 
 
