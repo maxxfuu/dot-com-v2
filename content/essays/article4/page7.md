@@ -1,6 +1,6 @@
 ## 1D Register Tiling: One Thread, TM Outputs
 
-Kernel 4 moved the traffic instead of removing it. Global loads per output element fell 32 times, runtime fell 1.41 times, and the count that did not move at all was the shared memory one: `2K` = 8192 reads per output element, one from `As` and one from `Bs` for every multiply accumulate. We swapped a 500 cycle load for a 25 cycle load and kept the number of loads identical.
+Kernel 4 moved the traffic instead of removing it. Global loads per output element fell 32 times, runtime fell 1.41 times, and the count that did not move at all was the shared memory one: `2K` = 8192 reads per output element, one from `As` and one from `Bs` for every multiply accumulate. We swapped a load that crosses the memory bus for a roughly 33 cycle shared memory load[^1], and kept the number of loads identical.
 
 The reason that count is stuck is the thread mapping, not the memory. One thread owns one element of C, so every value it pulls out of shared memory feeds exactly one FMA and is then discarded. There is no way to amortize a load across arithmetic when there is only one piece of arithmetic to amortize it against.
 
@@ -127,3 +127,5 @@ The occupancy table says the same thing from another direction. This kernel uses
 The reuse is one sided. A thread reads a value of A once and uses it once; it reads a value of B once and uses it `TM` times. Written as a ratio, `1 + TM` loads feed `TM` FMAs, so as `TM` grows the loads per FMA approach 1 and stop there. Even at `TM = 64` every FMA would still cost roughly one shared memory read, because the A side never amortizes at all.
 
 The fix is symmetric with the problem. A thread owns a column of C, which is why only B is shared among its outputs. Give it a rectangle instead and both operands amortize at once.
+
+[^1]: [Dissecting the SM_120 Microarchitecture: Cycle-Level Characterization of Blackwell Consumer GPUs](https://zartbot.github.io/micro_arch/nvidia/sm_120/paper.html)
