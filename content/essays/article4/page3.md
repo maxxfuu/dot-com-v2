@@ -1,6 +1,6 @@
 ## The Naive Kernel: Establishing a Baseline
 
-For the first kernel, we are really just trying to express GEMM in CUDA. We'll start off by using the grid, block, and thread to assign one thread to each output cell in the output matrix C. Start by expressing each thread with its respective global thread indices: 
+For the first kernel, we are really just trying to express GEMM in CUDA. We'll start off assigning the threads to each output cell within the output matrix C. Start by expressing each thread with its respective global thread indices: 
 
 ![Each thread computes one element of C, labelled here by the cell it owns as t[row][col]. Thread t[0][0] takes the top-left corner, and stepping one cell right or one cell down moves you exactly one column or one row through the output.](/images/gemm/matrix-c-indexing.png)
 
@@ -11,17 +11,23 @@ const int row = blockIdx.y * BLOCKSIZE + threadIdx.x;
 const int col = blockIdx.x * BLOCKSIZE + threadIdx.y;
 ```
 
-Given this mapping, a single thread computes the dot product between a row of A and a column of B, then writes the dot product into its corresponding output cell in C. 
+Given this mapping, a single thread computes the dot product between a row of A and a column of B, then writes the dot product into its corresponding output cell within the C matrix. 
 
-Therefore, we need to write the kernel for a single thread as everything will be executed in parallel within a warp. For each thread that writes to its own output cell in matrix C, the thread will walk the full K dimension between its corresponding row and column. Written out against our actual function signature, the entire kernel looks like this:
+So far, we view this kernel as the instruction that is responsible for a single thread. The thread will walk the full K dimension between its corresponding row within `A` and corresponding column within `B`. Written out against our actual function signature, the entire kernel looks like this:
 
 ```cuda
-template <const int BLOCKSIZE>
-__global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A,
-                            const float *B, float beta, float *C) {
-  const int row = blockIdx.y * BLOCKSIZE + threadIdx.x;
-  const int col = blockIdx.x * BLOCKSIZE + threadIdx.y;
+#include <cuda_runtime.h>
 
+// Ceiling division to round up the dimension of the grid so that blocks can be multiple of 32 threads.
+#define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
+
+// Enable compile time polymorphism to accept different BLOCKSIZE values
+template <const int BLOCKSIZE>
+__global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+  const int row = blockIdx.y * BLOCKSIZE + threadIdx.y;
+  const int col = blockIdx.x * BLOCKSIZE + threadIdx.x;
+  
+  // Check if threads is out of bounds
   if (row < M && col < N) {
     float acc = 0.0f;
     for (int i = 0; i < K; ++i) {
@@ -36,7 +42,7 @@ To visualize this naive kernel:
 
 ![Two neighbouring threads and the memory each one touches. Both walk the full K dimension, thread 0 reading row 0 of A against column 0 of B, thread 1 reading row 1 against the same column, to produce one element of C each.](/images/gemm/naive-access-pattern.png "large")
 
-To launch this kernel, we map `blockIdx.x` and `threadIdx.y` to col and `blockIdx.y` and `threadIdx.x` to row, so the `gridDim.x` walks along the `N` dimension and `gridDim.y` walks along the `M` dimension. For M = N = 4096 with BLOCKSIZE = 32, that's gridDim = (128, 128, 1) and blockDim = (32, 32, 1), or 16,384 blocks of 1024 threads each, one thread per output element.
+To launch this kernel, we map `blockIdx.x` and `threadIdx.x` to col and `blockIdx.y` and `threadIdx.y` to row, so the `gridDim.x` walks along the `N` dimension and `gridDim.y` walks along the `M` dimension. For M = N = 4096 with BLOCKSIZE = 32, that's gridDim = (128, 128, 1) and blockDim = (32, 32, 1), or 16,384 blocks of 1024 threads, one warp with 32 thread, 1 thread per output element.
 
 ``` cuda 
 const int BLOCKSIZE = 32;
@@ -48,19 +54,22 @@ dim3 blockDim(BLOCKSIZE, BLOCKSIZE);
 sgemm_naive<BLOCKSIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 ```
 
-Two details worth noticing. 
+### Memory Access Pattern
 
-Firstly, the CUDA hardware linearizes the threads in a block when forming warps. Even though we define the block with dimensions `x` and `y`, the CUDA hardware flattens everything into a single linear index. Therefore the `x` dimension is the fastest-changing dimension within the thread block. This matters because it dictates how each cell is accessed within the C matrix. In this case we will walk down column 0, such that the row value is the one incrementing: `c[0][0]`, `c[1][0]`, `c[n][0]`.
+The CUDA hardware performs thread linearization when forming the warps within the block. Even though we define the global thread index within the block with dimensions `x` and `y`, the CUDA hardware flattens everything into a single linear index. As a result, the `x` dimension is the fastest-changing dimension within the block. This matters because it dictates how each thread accesses the output cells within the C matrix. In this case, all 32 threads within 1 warp will collectively access a whole row within the C matrix. For each lockstep, each 32 threads walks down the column space, therefore 32 threads for the first lockstep collectively would access the `row 0` within matrix C, and for the second lockstep `row 1`. The exact formula CUDA defines for that linearization is:
 
-Secondly, the `CEIL_DIV` represents ceiling division, exists because the matrix dimensions are not required to be multiples of the block size, so we round the grid up and let the last blocks hang over the "edge". This is also why we have to have the boundary check in place; the `if (row < M && col < N)` guard inside the kernel prevents out-of-bounds threads from accessing garbage memory. In our kernel implementation, `M = N = K = 4096` with `BLOCKSIZE = 32` makes the division exact, but writing the kernel as though it isn't costs one comparison and further prevents bugs related to boundedness.
+``` latex
+\text{Linear Thread ID} =
+\text{threadIdx.x}
++ \text{threadIdx.y} \times \text{blockDim.x}
++ \text{threadIdx.z} \times \text{blockDim.x} \times \text{blockDim.y}
+```
+
+`CEIL_DIV` is ceiling division, and it exists because the matrix dimensions are not required to be multiples of the block size, so we round the grid up and let the last blocks hang over the "edge". This is also why we have to have the boundary check in place; the `if (row < M && col < N)` guard inside the kernel prevents out-of-bounds threads from accessing garbage memory. In our kernel implementation, `M = N = K = 4096` with `BLOCKSIZE = 32` makes the division exact, but writing the kernel as though it isn't costs one comparison and further prevents bugs related to boundedness.
 
 Running this kernel at M = N = K = 4096 takes **334.8 ms**, which works out to **410.5 GFLOP/s**. This will be our first baseline that we will try to optimize against cuBLAS's `cublasSgemm` implementation. Note that the cuBLAS implementation computes the same product in 3.817 ms at 36,011 GFLOP/s. This puts our FP32 SGEMM naive kernel **performance at 1.1%** of cuBLAS.
 
-One thing to fix about that reference before it gets quoted eleven more times. It is default math `cublasSgemm` running on the FP32 CUDA cores, not on tensor cores. That matters because this card will do considerably better than 36 TFLOP/s if you let it change the arithmetic: TF32 tensor operations reach roughly 60 TFLOP/s and FP16 inputs with FP32 accumulation roughly 113. No kernel in this article touches tensor cores, so 36,011 GFLOP/s is the honest target, and every percentage from here compares two implementations running on the same units.
-
-
-
-### Lower Bounding the Fastest Possible Runtime on a Theoretical GEMM
+### Arithmetic Analysis
 
 A lower bound identifies the fastest runtime achievable under ideal conditions; we are going to establish the compute floor and the memory floor as theoretical lower bounds on how quickly a **theoretical GEMM** can execute, based on the GPU's compute throughput and memory bandwidth.
 
@@ -114,8 +123,6 @@ T \geq \max(T_{\text{compute}}, T_{\text{memory}}) = 2.44\text{ ms}
 
 For now, know that there is no ideal SGEMM kernel with FP32 where dimensions M = N = K = 4096 with this specific GPU can finish in less than **2.44 ms**. With our hand written kernel, SGEMM took 334.8 ms, against a floor of 2.44 ms. It is 137 times slower than the ideal.
 
-### Placing The Naive Kernel On The Roofline
-
 Taking the higher of the two floors is not a trick, it is the roofline model from the previous section applied to a whole problem rather than to a kernel. Recall the shape of it: attainable performance is `min(P_peak, AI x BW)`, the ridge point on this card sits at **58.6 FLOP/byte**, and anything below that intensity is memory bound while anything above it is compute bound.
 
 Now we can place two different things on that roofline. First the problem itself. An ideal GEMM reads A, reads B, reads and writes C, which is the 268.4 MB we already counted, and it performs 137.44 GFLOP:
@@ -148,7 +155,7 @@ That is the honest position after kernel 1. We are memory bound with an intensit
 
 So really, there's only one question. Where did all this additional time come from and how are we 137 times slower than the theoretical? No single mistake accounts for the whole gap, but the first and the largest of them lies in **transaction**. How many separate chunks the memory system has to fetch to satisfy a single instruction. A memory instruction does not belong to a thread, it belongs to a warp. 
 
-### Inefficient Warp Memory Access Pattern
+### What Could be Improved
 
 Knowing that `threadIdx.x` is the fastest-changing dimension, warp 0 is `threadIdx.x` 0 through 31 at `threadIdx.y = 0`. And because we mapped `row` to `threadIdx.x`, those 32 lanes hold 32 consecutive **rows** at a single column. The warp maps onto a vertical strip of C, and onto A the same way.
 
