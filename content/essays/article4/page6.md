@@ -83,11 +83,25 @@ __global__ void sgemm_smem_tiling(int M, int N, int K, float alpha, const float 
 
 ```
 
+### Memory Access Pattern
+
+Step back from the indexing and there are three separate movements in this kernel, each with its own shape.
+
+The first is global to shared, and it happens once per tile per block. All 1024 threads take part, and the mapping is chosen so that a warp's 32 lanes land on 32 adjacent columns of a single row: `threadCol` is `threadIdx.x % 32`, the fast moving index, so each warp pulls 128 contiguous bytes of A and 128 of B in four sectors apiece. The block repeats this 128 times, sliding A right by 32 columns and B down by 32 rows, and every element of the two tiles is fetched from VRAM exactly once for the whole block rather than once per thread that wants it.
+
+The second is the barrier, and it is a memory movement even though it moves nothing. `__syncthreads()` is what turns 1024 independent loaders into one cooperative one. After it, no thread knows or cares which element it personally fetched, because all 2048 floats are equally available to all of them. That handoff is the entire reason the first movement is worth making.
+
+The third is shared to register, and it is the one that does not scale. Every thread reads a full row of `As` and a full column of `Bs`, 32 elements out of each, to feed the 32 multiply accumulates it owns. Across the block that is 1024 threads each pulling 64 floats out of a 2048 float working set, so every element of `As` is read by the 32 threads sitting in its row and every element of `Bs` by the 32 in its column. The reuse is real, and all of it now runs through the shared memory pipe.
+
+Those three movements are the win and the next problem in one picture. Traffic to VRAM fell by a factor of 32 because the block cooperates on the load. Traffic to the FMA units did not move at all, because the compute mapping never changed: one thread, one output, two reads per multiply.
+
 ### Key Mechanics
 
-1. The pointers `A`, `B`, and `C` are advanced to the block's top left corner before the loop starts. Each pointer marks the relative starting point for a tile. To move the pointers, `A += BLOCKSIZE` has to step 32 columns right and `B += BLOCKSIZE * N` has to step 32 rows down.
+1. The pointers `A`, `B`, and `C` are advanced to the block's top left corner before the loop starts. Each pointer marks the relative starting point for a pointer within the block tile. To move the pointers, `A += BLOCKSIZE` has to step 32 columns right and `B += BLOCKSIZE * N` has to step 32 rows down.
 
-2. The first `__syncthreads()` ensure all threads within a warp finishes executing before the warp starts computing again. Otherwise thread that reaches the dot product early would otherwise read cells of `As` and `Bs` that another warp has not written yet, and it would read whatever was there before. The second `__syncthreads` guards read before overwrite. Without it, a faster warp comes around the loop and starts writing the next tile into `As` while a slow warp is still multiplying with the current one. Removing either of the `__syncthreads` introduces a race condition.
+2. The first `__syncthreads()` holds every thread in the block until all 1024 of them have written their element into `As` and `Bs`. It is a block-wide barrier, not a warp-level one, and that is the point: a thread that reaches the dot product early would otherwise read cells of `As` and `Bs` that another warp has not written yet, and it would read whatever was there before. The second `__syncthreads` guards read before overwrite. Without it, a faster warp comes around the loop and starts writing the next tile into `As` while a slow warp is still multiplying with the current one. Removing either of the `__syncthreads` introduces a race condition.
+
+3. The block is 1024 threads, and that on its own caps residency at one block per SM. An SM holds 1536 threads, so a second block of 1024 does not fit and 512 thread slots go unused, which is 66.7% occupancy. `ptxas` reports 40 registers per thread and the two tiles cost 8192 bytes of shared memory, so neither of those is what binds here; the block size is. Note this is not a defect the next kernel repairs. It is a number worth having on hand before occupancy starts moving in the sections that follow.
 
 ### The Arithmetic
 
@@ -107,15 +121,21 @@ The shared memory tiling kernel moves the arithmetic intensity based on the roof
 
 ### What Could Be Improved
 
-Shared memory tiling dropped the global memory traffic by 32 times. However, against the previous kernel we've only increased the speed by a factor of 1.41x. This makes sense because we simply shifted the traffic from the global memory to shared memory, and as a result we are now bounded by shared memory bandwidth. 
+Shared memory tiling dropped the global memory traffic by 32 times. However, against the previous kernel we've only increased the speed by a factor of 1.41. This makes sense because we simply shifted the traffic from the global memory to shared memory, and as a result we are now bounded by shared memory bandwidth. 
 
 Now purely from the arithmetic side of things, there are 2 memory reads for every fused multiply add (FMA), precisely `2K = 8192` reads per output element. This is the same number that the previous kernel achieved prior to the shared memory tiling optimization, meaning we are still reading the same amount of data just from a different memory. So instead of `2K` reads out of global memory, we do `2K` reads out of shared memory. On the RTX 5080's GB203 die, a shared memory load returns in roughly 33 cycles[^1], against 358 cycles for an L2 hit and several hundred more if the line has to come all the way from GDDR7.[^2] Latency is not really the point here, though, because the previous kernel already had enough warps in flight to cover it. The point is traffic: those same 8192 reads no longer cross the memory bus. 
 
-Nsight Compute confirms this. The kernel spends 40.5 warp cycles per issued instruction, and 23.9 of those cycles (58.9%) are stalled on `Stall MIO Throttle`, which is a warp waiting for a shared memory instruction to issue. The previous kernel stalled 56.1% on `Stall LG Throttle`, the same queue for global memory. What this tells us it that threads now waste time waiting on data to be loaded from the shared memory region instead of the global memory. 
+Nsight Compute confirms this. The kernel spends 40.5 warp cycles per issued instruction, and 23.9 of those cycles (58.9%) are stalled on `Stall MIO Throttle`, which is a warp waiting for a shared memory instruction to issue. The previous kernel stalled 56.1% on `Stall LG Throttle`, the same queue for global memory. What this tells us is that threads now waste time waiting on data to be loaded from the shared memory region instead of the global memory. 
 
-Based on our GPU architecture, each SM has 1536 active threads. Since a block uses 1024 threads, the SM doesn't have enough space to fit another block of 1024 threads. This means there are 512 threads that sit idle when the block is launched on the SM. This tells a story of how threads are being underutilized; therefore, this is a thread mapping issue. 
+`Stall MIO Throttle` names the queue, but it does not tell us how far off we are. For that we need something to measure the inner loop against, and the shared memory pipe has a number. An SM can issue four warp-wide `FFMA` per cycle, one from each of its four sub-partitions. Shared memory is 32 banks four bytes wide, so it serves 128 bytes per cycle for the entire SM, and 128 bytes is exactly one warp-wide `LDS`. The hardware is therefore balanced at **four FMAs for every shared memory load**, and an inner loop below that ratio leaves FP32 units idle however many warps are resident.
 
-There are two key insights. Firstly, the wait between the threads has now moved to shared memory region. Secondly, we can fit more blocks on a thread. In the next kernel optimization, our main objective would be thread coarsening: optimizing the SGEMM kernel so that one thread can compute multiple cell outputs.
+Our inner loop issues two loads per FMA, which is 0.5. Against a balance point of 4 we are **eight times short**, so seven cycles out of every eight the arithmetic units have nothing to do but wait for the MIO queue to drain. That idle fraction is what the profiler is reporting from the other side.
+
+This is the roofline argument again, one level down the hierarchy. Up on the DRAM roof the ratio was FLOP per byte and the ridge point was 58.6; down here the ratio is FMA per load and the balance point is 4. The kernel climbed under the first ceiling and landed straight into the second, which is the whole reason that 32 times less traffic bought only 1.41 times the speed.
+
+And nothing about shared memory is what pins that ratio at 0.5. The thread mapping is. One thread owns one element of C, so every value it pulls out of `As` or `Bs` feeds exactly one FMA and is then thrown away. Two loads per FMA is not a cost of using shared memory, it is simply what one output per thread costs, and at one output per thread the ratio cannot be anything else. Making the loads cheaper cannot help either, because the loads are not what is expensive. Issuing that many of them is.
+
+Four FMAs per load is the number to get to, and getting there means changing what a thread owns.
 
 [^1]: [Dissecting the SM_120 Microarchitecture: Cycle-Level Characterization of Blackwell Consumer GPUs](https://zartbot.github.io/micro_arch/nvidia/sm_120/paper.html)
 [^2]: [Dissecting the NVIDIA Blackwell Architecture with Microbenchmarks](https://arxiv.org/abs/2507.10789)
