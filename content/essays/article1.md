@@ -44,10 +44,6 @@ Test the body to find where that access is missing, then choose a restoration ex
 
 The more comfortably you can breathe through new, biomechanically unfamiliar positions - through the parasympathetic nervous system, the "rest and digest" state - the better your body adheres to these unexplored positions. That adherence is what restores lost movement, and practicing postural-restoration exercises is what breaks down old compensatory strategies. When your body feels safe and your breathing is slow, that's the moment an old habit of breathing and moving breaks, and a new one forms.
 
----
-
 You can't change what you can't see. Your biomechanics is specific to you - where you're expanded or compressed, which phase of gait you're stuck in, your unique scapulohumeral rhythm. That's hard to feel from the inside, and it's why generic stretches or exercises don't help with fixing your posture.
-
-My co-founder and I are building Align, a companion that helps you work on your posture for good. Point your phone camera at yourself, take a few physical assessments, and it'll guide you through the restoration work tailored to you.
 
 > Align is in early access, and we're inviting a small group of beta testers to try it and shape where it goes. If you're interested, join the waitlist and fix your posture.
