@@ -33,9 +33,9 @@ In knowing this, you should immediately be aware that a CUDA kernel is not execu
 ## Execution Units
 CUDA Cores are the general-purpose arithmetic execution units used for many ordinary CUDA operations. 
 
-Tensor Cores, on the other hand, are specialized hardware designed to accelerate matrix multiplication and tensor operations, making them particularly important for deep learning workloads. 
+Tensor Cores on the other hand, are specialized hardware also for arithmetic execution, but specifically designed to accelerate matrix multiplication and tensor operations. This makes tensor cores remarkably performant, which is important for optimizing deep learning workloads. 
 
-Essentially, both are execution units that receive instructions and perform computations on data. The results of these computations are typically written back to registers, while Load/Store Units are responsible for moving data between registers and the memory hierarchy. CUDA Cores and Tensor Cores are both execution units within the SM, but they are specifized for different types of operations. 
+Both are execution units that receive instructions and perform computations on data. The results of these computations are typically written back to registers. And while Load/Store Units are responsible for moving data between registers and the memory hierarchy, CUDA Cores and Tensor Cores are both execution units within the SM, but they are specifized for different types of operations. 
 
 ## Load/Store Units 
 
@@ -54,21 +54,21 @@ We won't cover the details of cache operators here but if you want to understand
 
 ## Warp Schedulers
 
-Now a linger question you should have in the back of your head should be: "How does work actually get distributed across all of the SMs?". 
+Now a larger question you should have in the back of your head should be: "How does work actually get distributed across all of the SMs?". 
 
-This responsibility does not actually belong to the warp scheduler, instead it belongs to the **GigaThread Engine**. Its whole job is to take the work you launched with your kernel and hand it to an avaliable SMs. 
+This responsibility is on the warp scheduler, but it starts with the **GigaThread Engine**. The **GigaThread Engine** sits on the GPU die and governs all of the SMs. Its whole job is to take the work you launched with your kernel and hand it to an avaliable SMs. 
 
-Once a block is assigned to a SM by the GigaThread Engine, the threads within the block is divided into 32 threads groups called a warp.  At this point, know that the GigaThread engine determines which SM execuates a block, and the warp scheduler determines which warp executes an instruction next. 
+Once a block is assigned to a SM by the GigaThread Engine, the threads within the whole block is divided into groups of 32 threads called a warp. At this point, know that the GigaThread engine determines which SM execuates a block, and the warp scheduler determines which warp executes an instruction next. 
 
-As stated earlier in this chapter, each SM contains 4 sub-partitions, and each sub-partition contains one **warp scheduler**. During each clock cycle, the warp scheduler selects an eligble warp and issues its next instructions to the execution units available to that sub-partition.   
+As stated earlier in this chapter, each SM contains 4 sub-partitions, and each sub-partition contains one **warp scheduler**. So during each clock cycle, the warp scheduler selects an eligble warp and issues its next instructions to the execution units available to a sub-partition.   
 
 We will cover more detail when we introduce the CUDA execution model later.
 
 ## Memory Hierarchy
 
-The GPU memory hierarchy is also a very important concept to understand when it comes to optimizations. As you move down the hierarchy, the capacity of memory and latency both increases. 
+The GPU memory hierarchy is also a very important concept to understand when it comes to optimizations. As you move down the hierarchy, the capacity of memory increases but that also increases and latency to move data around. 
 
-At the highest level of the memory hierarchy, the registers are private to each thread which provides teh fasts look-up/storage. Shared memory is shared within a block which gives the programmer explicit control over frequently used data. L2 cache is shared across all SMs and is managed automatically by the hardware.The device memory is the largest memory but has the highest latency. 
+At the highest level of the memory hierarchy, the registers are private to each thread which provides the fasts look-up/storage. The next level down is Shared Memory whichis a block of memory that the CUDA practioner has explicit over usually to store frequently used data. Going a level deeper is the L2 cache, is shared across all SMs and is managed automatically by the hardware. At the bottom most level is the VRAM, device memory is the largest memory but has the highest latency. 
 
 ![Every level down costs an order of magnitude more, the key is to stay higher memory region for as long as possible.](/images/gemm/memory-hierarchy.png)
 
@@ -80,13 +80,13 @@ Everything discussed above is around the CUDA hardware, the first half of the CU
 
 The CUDA programming model is the software abstraction you write to harness the powerful GPU you have on hand. The CUDA Programming Model exposes a hierarchical model enabling CUDA practioners to express parallel execution through the division of grid, blocks, threads. 
 
-A grid is the complete collection of blocks. A block is a group of threads that execute and can cooperate with one another. And a thread is the smallest unit of execution exposed by the CUDA programming model. Every thread within a block executes the same instruction but just with different data. 
+A grid is the complete collection of blocks. A block is a group of threads that executes instructions and have the capacity to cooperate with one another. And a thread is the smallest unit of execution exposed by the CUDA programming model. Every thread within a block executes the same instruction but just with different data. When writing a CUDA kernel, we are writing the instructions for a single thread. 
 
-![Zooming in one level at a time: the grid is every block, a block is a group of threads that share memory and can synchronize, and a thread is the smallest unit of execution.](/images/gemm/programming-model.png)
+![Diagram of the CUDA Programming Model](/images/gemm/programming-model.png)
 
-Now, if every thread is executes the same instruction, what makes a thread within a warp different from every other threads? 
+Now, if every thread is executes the same instruction, what makes a thread within a warp different from every other threads? The answer is the threads position. 
 
-The answer is the threads position. CUDA has 4 built-in APIs that helps determine the position of a thread. Each API also has 3 possible variables `x`, `y`, or  `z` which determines the dimension direction. Writing CUDA kernels within the context of deep learning generally takes place around the `x` and `y` plane, within the 2-dimensional therefore the `z` variable is rarely used. 
+The CUDA programming model has 4 built-in APIs that helps determine the position of a thread. Each API also has 3 possible variables `x`, `y`, or  `z` which determines the dimension direction. Writing CUDA kernels within the context of deep learning generally takes place around the `x` and `y` plane, within the 2-dimensional therefore the `z` variable is rarely used. 
 
 The `threadIdx` and `blockIdx` determines where a thread sits within its block and the block's position within the grid. `blockDim` and `gridDim` determines the shape of the block or grid, respectively.
 
@@ -97,13 +97,13 @@ const int row = blockIdx.y * blockDim.y + threadIdx.y;
 const int col = blockIdx.x * blockDim.x + threadIdx.x;
 ```
 
-The diagram above has eight threads shown because that's all I could reasonably fit on a page, but a real block can hold upwards of **1024 threads**. What matters is that every thread executes the same instructions. There is no separate program for each thread; there is one kernel body, and each thread's unqiue index determines which data it accesses. This is what people mean when they call CUDA an **SIMT** model: single instructions, multiple threads.
+The diagram above has eight threads shown because that's all I could reasonably fit on a page, but in a real kernel a block can hold upwards of **1024 threads**. Understand that every thread executes the same instructions such that there is no separate program for each thread. There is one kernel body that, and each thread's unqiue index determines which data it accesses. This is what people mean when they call CUDA an **SIMT** model: single instructions, multiple threads.
 
-Also understand that the threads in the same block can hand data to each other through shared memory and they can line up at a `__syncthreads()` barrier, where no thread moves past it until every thread in the block has reached it. Note that this only applies to threads that share the same block. Note that threads in two *different* blocks do not share the same shared memory and cannot `__syncthreads()`. This isn't a software restriction CUDA is choosing to enforce - it's physical. A block is assigned to exactly one SM and stays resident there until every one of its threads finishes, so the shared memory it writes to and the barrier it synchronizes on are both hardware sitting on that specific SM. A block on a different SM has no way to reach either one.
-
-In our first GEMM kernel, the naive kernel implementation will use neither, but every optimization moving forward, starting with shared memory tiling, is built on both ideas. The key insight is to recognize that the block, not the thread, ends up being the unit you do most of your thinking in, which ultimately dictates how you write your kernel.
+Threads in the same block can hand data to each other through shared memory and they can line up at a `__syncthreads()` barrier, where no thread moves past it until every thread in the block has reached it. Note that this only applies to threads that share the same block. Threads in *different* blocks do not share the same shared memory and cannot `__syncthreads()`. A block is assigned to exactly one SM and stays resident there until every one of the warps finishes executing, so the shared memory it writes to and the barrier it synchronizes on are both hardware sitting on that specific SM. 
 
 ## CUDA Execution Model
+
+In the previous section we briefly dived into the CUDA programming model, that was introduction to the software abstraction to structure parallel code. Now we will dive into the CUDA exeuction model, the governing principles that determine how GPU hardware maps, schedules, and runs the software abstractions. 
 
 On the software level, the thread is the smallest unit of execution. But on the hardware level, the smallest unit of execution is the **warp**: a group of 32 threads that the SM issues instructions for as one. A block is made up of multiple warps - a 1024-thread block is 32 of them.
 
@@ -135,58 +135,9 @@ Nearly every optimization in this article follows from the warp. Coalescing is a
 
 This section of the article covers the most bare-bones aspects of CUDA programming and CUDA hardware architecture. It should be just enough to follow every kernel that comes after it. However, if you want to dive deeper into what happens when you run a CUDA kernel, check out Fergus Finn's blog.[^5]
 
-## The Roofline Model
-
-The roofline model is a way to guage the performance of a kernel relative to the hardware the kernel is running on. It is the tool this article uses throughout each page decide what to optimize next.
-
-The idea is that a kernel can be bounded by compute, memory, or some overhead[^1]. It is often limited compute or memory, but never by both at once. 
-
-The first limitation is arithmetic. The RTX 5080 can at most perform 56.3 TFLOP/s of FP32, and no kernel can exceed this no matter how little memory it touches. 
-
-The second limitation is bandwidth. The VRAM delivers at most 960 GB/s, so a kernel that needs a lot of bytes per unit of arithmetic runs out of bandwidth long before it runs out of FP32 units.
-
-To determine if you're compute bound or memory bound is entirely dependent on the ratio of floating point operations per byte; and that ratio is called **arithmetic intensity**. It is the number of floating point operations a kernel performs for every byte it moves.
-
-``` latex
-P_{\text{attainable}} =
-\min\left(P_{\text{peak}},\ AI \times BW\right)
-```
-
-Plotting that gives the shape the model is named for. Performance rises along a slope as intensity increases, because a kernel with more arithmetic per byte gets more out of the same bandwidth, and then it flattens into a roof once the FP32 units saturate. The two pieces meet at one intensity, the **ridge point**, where the machine's arithmetic and its bandwidth are exactly in balance:
-
-``` latex
-AI_{\text{ridge}} =
-\frac{56.3\text{ TFLOP/s}}
-{960\text{ GB/s}}
-\approx 58.6\text{ FLOP/byte}
-```
-
-![The roofline for the RTX 5080, with arithmetic intensity in FLOP per byte on the x axis and attainable performance in TFLOP/s on the y axis, both log scale. The sloped line rises at 960 GB/s until it meets the flat 56.3 TFLOP/s ceiling at the ridge point of 58.6 FLOP/byte. Everything left of the ridge is the memory bound region, where DRAM is the limit and extra FLOPs are free, and the way out is to raise intensity by reusing data through shared memory and register tiling. Everything right of it is the compute bound region, where the SMs are the limit and only more FLOP/s helps.](/images/gemm/roofline-model.png "full")
-
-So on this card a kernel has to perform roughly 59 floating point operations for every byte it pulls from VRAM just to keep the arithmetic units fed. Put in terms of the FP32 numbers we are actually multiplying, that is about 234 operations for every 4 byte float loaded. A kernel below that intensity is **memory bound** and its ceiling is the sloped one; a kernel above it is **compute bound** and its ceiling is flat. Note that intensity is a property of the kernel and the ridge point is a property of the card, which means the ridge point is fixed and the only thing we get to move is the kernel.
-
-It is worth knowing where this card sits. 58.6 FLOP/byte is a demanding ridge point, because the 5080 pairs a great deal of FP32 throughput with a fairly narrow 256 bit memory bus. A GPU with more bandwidth per FLOP has a lower ridge and forgives a sloppier kernel. That is also why performance numbers from an article written on a different card do not transfer to this one, and why every figure in this article was measured here rather than copied.
-
-One caveat to carry forward, because we will run into it almost immediately. The bandwidth in the model is VRAM bandwidth, so the model quietly assumes every byte a kernel asks for is a byte that travels all the way from VRAM. Caches break that assumption. A value that is still sitting in L2 costs a fraction of what the model charges for it, so a kernel can measure *faster* than its own roofline says is possible. When that happens it is not a broken measurement, it is the model telling you that the traffic you counted is not the traffic that actually reached memory. That distinction turns out to be the difference between the first optimization in this article working and the second one being necessary.
-
-## What is GEMM
-
-Before we actually begin writing our GEMM kernels and go through an iterative process on optimizing it, let's first establish what a General Matrix Multiplication (GEMM) is so that we understand what's going on behind the scenes with every implementation. Every kernel in this article computes the exact same thing; an output matrix C computed by matrices A and B. The **GEMM** follow the same mathematical formula listed below:
-
-``` latex
-C \leftarrow \alpha A B + \beta C
-```
-
-Note that variables alpha and beta are just scalar coefficients that scale the matrix multiplication and the existing output matrix C.
-
-**A is (M x K)**, **B is (K x N)**, and **C is (M x N)**. All three of these matrices are stored in row-major order in memory. Each optimized kernel thats introduced within the article will use the following dimensions: **M = N = K = 4096**, **alpha = 1**, **beta = 0**. 
-
-This ensures that very kernel performs the same 2 * M * N * K floating point operations, which is roughly 137 billion operation in total, against the same three matrices. It's really just a basic matrix multiplication.
-
 [^1]: [How CUDA Programming Works - Stephen Jones, CUDA Architect](https://www.youtube.com/watch?v=QQceTDjA4f4&t=75s)
 [^2]: [NVIDIA RTX Blackwell GPU Architecture](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf)
 [^3]: [Programming Massively Parallel Processors: A Hands-on Approach (5th Edition)](https://www.amazon.com/dp/0443439001)
 [^4]: [Understanding Latency Hiding on GPUs](https://www2.eecs.berkeley.edu/Pubs/TechRpts/2016/Archive/EECS-2016-143.pdf)
 [^5]: [What happens when you run a CUDA kernel](https://fergusfinn.com/blog/what-happens-when-you-run-a-gpu-kernel/#an-interposition-hook)
 [^6]: [NVIDIA's PTX ISA documentation](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=Cache#cache-operators)
-

@@ -1,159 +1,131 @@
-## 2D Register Tiling: The Outer Product
+## 1D Register Tiling: One Thread, TM Outputs
 
-Kernel 5 tiled one dimension and got a one sided result. A thread owning a column of C shares a B value across all `TM` of its outputs and shares nothing on the A side, so `1 + TM` loads feed `TM` FMAs and the ratio bottoms out at one load per FMA no matter how tall the column gets.
+Kernel 4 moved the traffic instead of removing it. Global loads per output element fell 32 times, runtime fell 1.41 times, and the count that did not move at all was the shared memory one: `2K` = 8192 reads per output element, one from `As` and one from `Bs` for every multiply accumulate. We swapped a load that crosses the memory bus for a roughly 33 cycle shared memory load[^1], and kept the number of loads identical.
 
-Give the thread a rectangle instead. If a thread owns a `TM x TN` patch of C, then for one step of K it needs `TM` values of A, the rows of its patch, and `TN` values of B, the columns of its patch. Every one of the `TM x TN` outputs is a product of one of those A values with one of those B values, so `TM + TN` loads feed `TM x TN` FMAs.
+The reason that count is stuck is the thread mapping, not the memory. One thread owns one element of C, so every value it pulls out of shared memory feeds exactly one FMA and is then discarded. There is no way to amortize a load across arithmetic when there is only one piece of arithmetic to amortize it against.
 
-That is an outer product. The thread loads a short column vector from `As` and a short row vector from `Bs`, forms every pairwise product between them, and accumulates the whole `TM x TN` grid at once. At `TM = TN = 8` that is 16 loads feeding 64 FMAs, four FMAs per load, against kernel 5's 9 loads feeding 8.
+So give a thread more than one output. Let one thread own a short column of C, `TM` elements tall, all in the same column and in consecutive rows. Those `TM` outputs all need the same element of B, because they share a column, and they need `TM` different elements of A. The thread loads the B value once into a register and multiplies it against `TM` values of A. One shared memory read now feeds `TM` FMAs instead of one.
 
-![The block owns a 128 x 128 tile of C divided into 256 patches, one per thread, with As held as 128 x 8 and Bs as 8 x 128. One thread owns an 8 x 8 patch, fed by the 8 rows of A and 8 columns of B that intersect at it. The inset compares the two shapes directly: kernel 5's TM x 1 column takes 1 + TM = 9 loads to feed 8 FMAs, which is 0.9 FMAs per load, while kernel 6's TM x TN patch takes TM + TN = 16 loads to feed 64 FMAs, which is 4 FMAs per load.](/images/gemm/register-2d-patch.png "full")
+![One block owns a 64 x 64 tile of C and walks K in steps of BK = 8, loading a 64 x 8 tile of A into As and an 8 x 64 tile of B into Bs. The zoom on a 16 x 16 corner of the C tile shows the change in mapping: kernel 4 gave one thread one cell, and now one thread owns a column of 8 consecutive cells in the same column, with the next thread taking the column beside it.](/images/gemm/register-1d-overview.png "full")
 
-The ratio is `(TM + TN) / (TM x TN)`, which falls as the patch grows, and that is the first place in this series where a knob exists that keeps paying. It is also the first knob with a real price, and the price is registers: those `TM x TN` accumulators live in registers for the entire lifetime of the kernel.
+That is the whole idea, and the accounting for it is immediate. Per step of the K loop a thread reads `1` value of B and `TM` values of A, so `1 + TM` reads produce `TM` results instead of `2` reads producing `1`.
+
+![One thread at one step of the BK loop. Kernel 4's two shared memory reads per result become 1 + TM reads for TM results: a single read from the Bs row lands in a register and is reused TM times, while TM values are read down a column of As, and the two feed TM = 8 fused multiply-adds accumulating into 8 registers. The figure names the broadcast register Btmp; the listing below calls it regN.](/images/gemm/register-1d-inner-loop.png "large")
 
 ### The Kernel
 
-The block tile doubles again in both dimensions, to `128 x 128`, and each thread produces an `8 x 8` patch, so the block needs `(128 x 128) / (8 x 8) = 256` threads. Note that the thread count is falling as the tiles grow, 1024 to 512 to 256, because the work per thread is rising faster than the tile is:
+The tile shape changes along with the thread mapping. The block now owns a `64 x 64` tile of C and walks K in steps of `BK = 8`, and because each thread produces `TM = 8` outputs the block needs `(64 x 64) / 8 = 512` threads rather than 4096:
 
 ```cuda
-const int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+const int BM = 64, BN = 64, BK = 8, TM = 8;
 
 dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
-dim3 blockDim((BM * BN) / (TM * TN));   // 256
+dim3 blockDim((BM * BN) / TM);   // 512
 
-sgemm_register_tiling_2d<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+sgemm_register_tiling_1d<BM, BN, BK, TM><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 ```
 
-```cuda
-template <const int BM, const int BN, const int BK, const int TM, const int TN>
-__global__ void sgemm_register_tiling_2d(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
-  const int cRow = blockIdx.y;
-  const int cCol = blockIdx.x;
+``` cuda 
+#include <cuda_runtime.h>
 
-  __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+// Template accepts block dimensions followed by a thread mulitiplier
+template <const int block_M, const int block_N, const int block_K, const int thread_multiplier>
+__global__ void sgemm_1d_register_tiling(int M, int N, int K, float alpha, float beta, float *A, float *B, float *C) {
+  const int C_Row = blockIdx.y;
+  const int C_Col = blockIdx.x;
 
-  constexpr int NUM_THREADS = (BM * BN) / (TM * TN);
+  // shared memory allocation
+  __shared__ float A_smem[block_M * block_K];
+  __shared__ float B_smem[block_K * block_N];
 
- const int threadCol = threadIdx.x % (BN / TN);
-  const int threadRow = threadIdx.x / (BN / TN);
+  // Set pointer at top left coner of the block tile
+  A += C_Row * block_M * K;
+  B += C_Col * block_N;
+  C += C_Row * block_M * N * C_Col * block_N;
 
-  A += cRow * BM * K;                   
-  B += cCol * BN;                       
-  C += cRow * BM * N + cCol * BN;       
+  // calculate coordinates for computation within the block tile
+  const int thread_col = threadIdx.x % block_N;
+  const int thread_row = threadIdx.x % block_N;
 
-  const int innerColA = threadIdx.x % BK;             
-  const int innerRowA = threadIdx.x / BK;             
-  constexpr int ROW_STRIDE_A = NUM_THREADS / BK;                
+  // calculate coordinates for block tile
+  const int inner_col_A = threadIdx.x % block_K;
+  const int inner_row_A = threadIdx.x / block_K;
 
-  const int innerColB = threadIdx.x % BN;             
-  const int innerRowB = threadIdx.x / BN;             
-  constexpr int ROW_STRIDE_B = NUM_THREADS / BN;                
+  const int inner_col_B = threadIdx.x % block_N;
+  const int inner_row_B = threadIdx.x / block_N;
 
-  float threadResults[TM * TN] = {0.0f};
+  // static array allocated within the on-chip registers
+  float thread_results[thread_multiplier] = {0.0f};
 
-  float regM[TM] = {0.0f};
-  float regN[TN] = {0.0f};
+  for (int block_idx = 0; block_idx < K; block_idx += block_K) {
+    // load data from global memory into shared memory
+    A_smem[inner_row_A * block_K + inner_col_A] = A[inner_row_A * K + inner_col_A];
+    B_smem[inner_row_B * block_K + inner_col_B] = B[inner_row_B * K + inner_col_B];
 
-  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
-
-    for (int offset = 0; offset < BM; offset += ROW_STRIDE_A) {
-      As[(innerRowA + offset) * BK + innerColA] =
-          A[(innerRowA + offset) * K + innerColA];
-    }
-
-    for (int offset = 0; offset < BK; offset += ROW_STRIDE_B) {
-      Bs[(innerRowB + offset) * BN + innerColB] =
-          B[(innerRowB + offset) * N + innerColB];
-    }
     __syncthreads();
 
-    A += BK;
-    B += BK * N;
+    // advance global pointers to the next block iteration
+    A += block_K;
+    B += block_K * N;
 
-    for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+    // compute thread_multiplier elelments per thread
+    for (int dot_product_idx = 0; dot_product_idx < block_K; ++dot_product_idx) {
+      // load one temporary B element into a register per iteration
+      float temp_B = B_smem[dot_product_idx * block_N + thread_col];
 
-      for (int i = 0; i < TM; ++i) {
-        regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
-      }
-
-      for (int i = 0; i < TN; ++i) {
-        regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
-      }
-
-      for (int resIdxM = 0; resIdxM < TM; ++resIdxM) {
-        for (int resIdxN = 0; resIdxN < TN; ++resIdxN) {
-          threadResults[resIdxM * TN + resIdxN] += regM[resIdxM] * regN[resIdxN];
-        }
+      for (int res_idx = 0; res_idx < thread_multiplier; ++res_idx) {
+        thread_results[res_idx] += A_smem[(thread_row * thread_multiplier + res_idx) * block_K + dot_product_idx] * temp_B;
       }
     }
+
     __syncthreads();
   }
 
-  for (int resIdxM = 0; resIdxM < TM; ++resIdxM) {
-    for (int resIdxN = 0; resIdxN < TN; ++resIdxN) {
-      const int cIdx = (threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN;
-      C[cIdx] = alpha * threadResults[resIdxM * TN + resIdxN] + beta * C[cIdx];
-    }
+  for (int res_idx = 0; res_idx < thread_multiplier; ++res_idx) {
+    C[(thread_row * thread_multiplier + res_idx) * N + thread_col] =
+        alpha * thread_results[res_idx] +
+        beta * C[(thread_row * thread_multiplier + res_idx) * N + thread_col];
   }
 }
+
 ```
 
 ### Mechanics
 
-1. **The loads need loops now, and that is a consequence of the arithmetic.** `As` holds `BM x BK = 1024` floats and there are only 256 threads, so each thread copies four elements rather than one. The loop steps by `ROW_STRIDE_A = NUM_THREADS / BK = 32`, which is how many complete rows of the A tile 256 threads cover in one pass, and it runs `BM / ROW_STRIDE_A = 4` times. `Bs` is also 1024 floats but its rows are 128 wide, so `ROW_STRIDE_B = NUM_THREADS / BN = 2` and the loop again runs four times over `BK = 8` rows. Both loops keep `innerCol` on the fast moving index, so every pass is still a fully coalesced global read.
+1. **One hoisted line is the entire kernel.** `float regN = Bs[dotIdx * BN + threadCol];` sits outside the `resIdx` loop, so the B value is read once and reused `TM` times from a register. Move that line inside the inner loop and you have written kernel 4 again with extra steps: same results, same arithmetic, eight times the shared memory reads. Everything else in this file is bookkeeping to make that hoist possible.
 
-2. **Three loops, and only the last one is arithmetic.** The `dotIdx` body is a load of `TM` values into `regM`, a load of `TN` values into `regN`, and then a `TM x TN` product grid. Splitting it this way is what makes the reuse explicit to the compiler: the two small loops are the only shared memory traffic in the kernel, and the nested pair underneath them touches registers exclusively. Fusing the loads into the product loops would read the same values `TM` and `TN` times over and undo the entire section.
+2. **The same 512 threads are decomposed two different ways.** For loading, `innerRowA`/`innerColA` cut the block into a `64 x 8` grid matching the shape of the A tile, and `innerRowB`/`innerColB` cut it into `8 x 64` matching the B tile. For computing, `threadRow`/`threadCol` cut it into `8 x 64`, where the row index is scaled by `TM` on use. This is what kernel 3 was for. None of these three shapes is the launch shape, and all three come out of the same flat `threadIdx.x`.
 
-3. **`regM` reads down a column of `As` with stride `BK`.** `As[(threadRow * TM + i) * BK + dotIdx]` walks `i` across rows of the tile, so consecutive `i` are 8 floats apart in shared memory. Shared memory has no coalescing requirement, but it does have banks, and a strided read of this shape is the thing kernel 10 eventually has to look at. It is not costing us yet at `BK = 8`.
+3. **The loads still land exactly, with no loop.** `As` holds `BM x BK = 512` floats and `Bs` holds `BK x BN = 512`, and there are 512 threads, so each thread copies one element of each and the load is a single statement. This is a coincidence of the chosen tile shape, not a property of the technique, and the next kernel loses it.
 
-4. **The register budget is the real ceiling on `TM` and `TN`.** A thread holds `TM x TN = 64` accumulators plus `TM + TN = 16` staging values, and `ptxas` reports 93 registers per thread for this kernel with nothing spilled. At 256 threads that is 2 blocks per SM. Doubling `TM` and `TN` to 16 would want 256 accumulators, which is past the 255 register hard limit per thread, so the loop would spill to local memory and the kernel would collapse. The knob does keep paying, right up until it does not pay at all.
+4. **`threadRow * TM + resIdx`, not `threadRow + resIdx * something`.** A thread's `TM` outputs are consecutive rows, so its rows are `threadRow * TM` through `threadRow * TM + TM - 1`. That keeps `threadCol` as the fast moving index across a warp, which keeps the store to C coalesced. The read from `As` marches down a column of the tile with a stride of `BK`, which shared memory does not mind the way global memory would.
 
-Kernel 6 runs in **6.996 ms at 19644.4 GFLOP/s, which is 54.6% of cuBLAS at `M = N = K = 4096`**, up from 10.506 ms and 36.3%. Half of cuBLAS, from a kernel whose inner loop is nine lines of scalar arithmetic.
+Kernel 5 runs in **10.506 ms at 13081.8 GFLOP/s, which is 36.3% of cuBLAS at `M = N = K = 4096`**, up from 33.268 ms and 11.5%. That is 3.17 times faster than kernel 4, and the largest single jump in the series.
 
 ### The Arithmetic
 
-Both counts move this time, and it is worth writing the general form down once because it explains every tile shape decision left in the series. For a block tile of `BM x BN` walked over K in steps of `BK`, each trip loads `BM x BK` elements of A and `BK x BN` elements of B to produce `BM x BN` results, over `K / BK` trips:
+Global memory first, because the tile grew. `K x (1/BM + 1/BN)` with `BM = BN = 64` gives `K / 32 = 128` loads per output element, down from 256, so doubling each tile dimension halved global traffic to **8.59 GB**. That is a real improvement and it is not where the speedup came from.
+
+Shared memory is where the section lives. Per step of the K loop a thread now issues `1 + TM = 9` reads to produce `TM = 8` results, so:
 
 ```
-GMEM accesses per result = (K / BK) * (BM*BK + BK*BN) / (BM*BN)
-                         = K * (1/BM + 1/BN)
+SMEM accesses per result = K * (1 + TM) / TM
+                         = 4096 * 9 / 8
+                         = 4608
 ```
 
-`BK` cancels. Global traffic per output depends only on the two block tile dimensions, and it is a sum of reciprocals, which means that for a fixed tile area a square tile minimizes it. At `BM = BN = 128` that is `K / 64 = 64` loads per output element, half of kernel 5's 128, for a total of **4.29 GB**. Remember that this says square is best, because kernel 8 is going to pick a rectangle and win.
+against `2K = 8192` for kernel 4. That is a factor of **1.78**, and the runtime moved by a factor of **3.17**. The count under-predicts the win by nearly twice, which is worth stopping on because it is the opposite of kernel 4's problem, where the count over-predicted.
 
-The shared memory count has exactly the same shape one level down, with the thread tile in place of the block tile:
+The reason is that a shared memory read is not only a latency to be hidden, it is an instruction to be issued. Kernel 4's inner loop issued two `LDS` and one `FFMA` per output; this one issues nine `LDS` and eight `FFMA` per eight outputs. The loads that disappeared took issue slots with them, and the ratio of memory instructions to arithmetic instructions went from 2:1 to 9:8. Access counts measure bytes touched. They do not measure the instruction stream, and from here on the instruction stream is increasingly what we are fighting.
 
-```
-SMEM accesses per result = K * (1/TM + 1/TN)
-                         = 4096 / 4
-                         = 1024
-```
+Nsight measures that shift directly. Kernel 4 sat at 40.5 warp cycles per issued instruction with 23.9 of them, 58.9%, stalled on `Stall MIO Throttle`, the queue a warp waits in for a shared memory instruction to issue. This kernel runs at **21.0 warp cycles per issued instruction with MIO throttle down to 6.6 cycles, 31.4%**. The stall did not merely shrink in proportion to the loads removed; the whole issue pipeline got shorter.
 
-That is **4.5 times fewer** than kernel 5's 4608, and 8 times fewer than kernel 4's 8192. Runtime moved 1.50 times. As with kernel 5 the count and the clock disagree, but this time the count over-predicts, which is the signal that shared memory reads have stopped being the dominant cost and something else is taking over.
-
-### Where We Are On The Roofline
-
-Arithmetic intensity is now `137.44 GFLOP / 4.29 GB = 32 FLOP/byte`, up from 8 at kernel 4 and 16 at kernel 5. The ridge point is 58.6, so for the first time the kernel is within striking distance of the compute bound region rather than three orders of magnitude away from it.
-
-More useful than the position is what happens to the two floors. The memory floor for 4.29 GB at 960 GB/s is `4.47 ms`, and the compute floor has been 2.44 ms all along. Those two numbers are now within a factor of two of each other, where at kernel 1 they were 573 ms against 2.44 ms. The model has stopped being a story about bandwidth and started being a story about both resources at once, which is what a well tiled GEMM is supposed to look like.
-
-We measured 6.996 ms against a 4.47 ms memory floor and a 2.44 ms compute floor, so we are 1.56 times off the binding one. The sloped ceiling at 32 FLOP/byte sits at `32 x 960 = 30720 GFLOP/s` and we are at 19644, which is 64% of it. Every kernel from here on is trying to close that last 1.56 times, and none of them will do it by reducing traffic further.
-
-### The Occupancy Trap
-
-There is one number in this section that looks like a regression. Kernel 5 ran at 66.7% occupancy. Kernel 6 uses 93 registers per thread, which at 256 threads per block allows 2 blocks per SM, 8 warps out of a possible 48, or **33.3% occupancy**. We halved the occupancy and the kernel got 1.5 times faster.
-
-This is the point in the series where "higher occupancy is better" has to be retired. Occupancy is not a goal, it is one of two ways to hide latency. Many resident warps hide it by having something else to run whenever one warp stalls. Instruction level parallelism hides it by giving a single warp a long run of independent work, and 64 independent FMAs accumulating into 64 separate registers is exactly that: none of them depends on the result of another, so the scheduler can keep the pipeline full from one warp alone.
-
-Register tiling deliberately trades the first mechanism for the second. Every kernel from here spends registers to buy independent work per thread, occupancy keeps falling, and performance keeps rising. The final kernel in this series runs at 16.7%.
+The occupancy table says the same thing from another direction. This kernel uses 48 registers per thread against kernel 4's 40, and at 512 threads per block that is 2 blocks per SM and 66.7% occupancy, identical to kernel 4's. We bought an extra 8 registers per thread and paid nothing for them.
 
 ### What Could Be Improved
 
-The remaining shared memory reads are few, but each one is its own instruction. The inner loop issues 16 separate 32 bit `LDS` instructions per `dotIdx`, eight down a column of `As` and eight along a row of `Bs`, to feed 64 FMAs. The data volume is no longer the problem; the number of instructions carrying it is.
+The reuse is one sided. A thread reads a value of A once and uses it once; it reads a value of B once and uses it `TM` times. Written as a ratio, `1 + TM` loads feed `TM` FMAs, so as `TM` grows the loads per FMA approach 1 and stop there. Even at `TM = 64` every FMA would still cost roughly one shared memory read, because the A side never amortizes at all.
 
-That distinction has a name in the profiler, and the measurement is more interesting than a confirmation would have been. `Stall MIO Throttle` is a warp waiting for a shared memory instruction to *issue* rather than for the data it asked for, and it is what kernel 4 was drowning in: 23.9 of its 40.5 warp cycles per issued instruction, 58.9%. Kernel 5 cut that to 6.6 of 21.0, 31.4%. This kernel comes in at **7.49 warp cycles per issued instruction, and Nsight names no dominant stall reason for it at all**. Kernel 5's 31.4% was large enough to trip the rule; nothing here is.
+The fix is symmetric with the problem. A thread owns a column of C, which is why only B is shared among its outputs. Give it a rectangle instead and both operands amortize at once.
 
-So MIO throttle is not what bounds this kernel, and the case for the next one does not rest on it. It rests on the count above. Sixteen `LDS` per `dotIdx` to feed 64 FMAs is a lot of issue slots spent carrying very little data, and issue slots are now the scarce resource. The fix does not move a single byte less. It moves the same bytes in a quarter of the instructions.
-
-<!-- TODO: smsp__inst_executed.sum on kernels 6 and 7, to state the instruction
-     reduction as measured rather than derived. WarpStateStats is done. -->
+[^1]: [Dissecting the SM_120 Microarchitecture: Cycle-Level Characterization of Blackwell Consumer GPUs](https://zartbot.github.io/micro_arch/nvidia/sm_120/paper.html)

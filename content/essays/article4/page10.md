@@ -1,95 +1,69 @@
-## Warp Tiling: A Third Level of Tiling
+## Vectorized Memory Access: 128-bit Loads and Stores
 
-Kernel 7 left a warp smeared across the block tile. `threadRow = threadIdx.x / 16` cuts the 256 threads into rows of 16, so one warp of 32 consecutive threads covers two of those rows, which is 128 columns and 16 rows of the output. Every shared memory instruction that warp issues reaches across the full width of `Bs`, and nothing chose that shape. It is a side effect of how `threadIdx.x` happened to divide.
+Kernel 6 ended with a distinction that matters from here on. Its inner loop reads 16 floats out of shared memory to feed 64 FMAs, which is a small amount of data carried by a large number of instructions: eight separate 32 bit loads down a column of `As` and eight more along a row of `Bs`, every `dotIdx`, in every thread. A warp waiting for those to issue rather than for their data is stalled on `MIO Throttle`, and that is a queue for the load store pipe, not a bandwidth problem. Kernel 6 is no longer dominated by that stall (at 7.49 warp cycles per issued instruction, Nsight names no dominant reason for it), but the instruction count is real either way, and it is what this kernel removes.
 
-This matters because the warp, not the thread, is the unit that executes. When a warp issues one `LDS.128`, the hardware resolves 32 lane addresses together, and what it costs depends on how those 32 addresses are spread across banks and how much of the data they pull in is shared. A warp reading a compact rectangle asks for a small, dense range. A warp reading a wide strided band asks for a large sparse one, gets the same answer, and pays more for it.
+Nothing about the data needs to change. The GPU can move 128 bits in a single instruction, and a `float4` is exactly four contiguous floats, so if the four values a thread wants next to each other in memory really are next to each other, one `LDS.128` replaces four `LDS.32`. Same bytes, quarter the instructions, and the queue drains four times faster.
 
-So add a level. The block tile already splits into thread tiles; now put a warp tile between them. Each of the block's warps takes a contiguous `WM x WN` rectangle of the output, and the threads within that warp tile the rectangle among themselves. The decomposition becomes block, then warp, then thread, and every level is now an explicit parameter rather than an accident of integer division.
+The whole section is therefore about making the values contiguous in the right direction, because two of the three places we touch memory are already contiguous and one is not.
 
-### The Warp Tile Is Not Contiguous Either
+### Why `As` Has To Be Transposed
 
-There is one twist that the parameter names give away. A warp has 32 threads each producing `TM x TN = 16` outputs, which is 512 outputs, but the warp tile is `WM x WN = 64 x 32 = 2048`. The warp must therefore cover its rectangle in four passes, and the code expresses that as `WMITER x WNITER` sub-tiles of size `WSUBM x WSUBN`.
+Look at what a thread reads out of `As` in kernel 6: `As[(threadRow * TM + i) * BK + dotIdx]`. Consecutive `i` are `BK` floats apart, because `As` is stored row major with a row length of `BK`. That is a strided read, and a strided read cannot be a `float4` no matter how it is spelled.
 
-The sub-tiles are interleaved rather than laid end to end. Within one sub-tile of `32 x 16`, the warp's 32 threads form a compact `8 x 4` grid of `4 x 4` patches, so the warp's read out of `Bs` for that sub-tile spans exactly `WSUBN = 16` consecutive floats and its read out of `As` spans `WSUBM = 32`. Compare that with kernel 7, where the equivalent read spanned all 128 columns of the tile. The instruction count per warp is unchanged; the footprint of each instruction is eight times narrower.
+The fix is to store `As` transposed, as `BK` rows of `BM` floats instead of `BM` rows of `BK`. Then a thread's `TM` values sit at `As[dotIdx * BM + threadRow * TM + i]`, consecutive in `i`, and `TM = 8` becomes two 128 bit loads instead of eight 32 bit ones.
 
-`WMITER` is not a parameter you pass. It is whatever is left once the others are fixed, which is why it is a `constexpr` derived inside the kernel:
-
-```
-WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER)
-       = (64 * 32) / (32 * 4 * 4 * 2)
-       = 2
-```
-
-If that division does not come out whole, the config is not slow, it is wrong, and threads either overlap or leave holes in C. Nothing in this kernel checks it. The next section is about that.
+The transpose has to happen on the store side, not the load side, and that is the constraint the whole indexing scheme is built around. The read from global memory has to stay coalesced, which means a warp must read along a row of A, along the K dimension. So the thread reads four contiguous floats of A, then writes them into four different rows of `As`, one element each, scattering as it goes. We accept a scattered write into shared memory to preserve a contiguous read from global memory and to buy a contiguous read out of shared memory later. `Bs` needs none of this; it is already stored with `BN` as the fast dimension, which is the direction its readers want.
 
 ### The Kernel
 
-The config changes shape in a way worth flagging before the listing. The block tile is `128 x 64`, which is not square for the first time in the series, `BK` doubles to 16, the thread tile *shrinks* from `8 x 8` to `4 x 4`, and the block runs on 128 threads, one warp fewer than a quarter of kernel 7's:
+The tile shape and thread count are unchanged from kernel 6, so this is a pure instruction level change with the same launch:
 
 ```cuda
-const int BM = 128, BN = 64, BK = 16;
-const int WM = 64, WN = 32, WNITER = 2;
-const int TM = 4, TN = 4, NUM_THREADS = 128;
+const int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
 
 dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
-dim3 blockDim(NUM_THREADS);
+dim3 blockDim((BM * BN) / (TM * TN));   // 256, same as kernel 6
 ```
 
-Every one of those numbers came out of a search rather than an argument, which is the subject of the next section and the closing point of this one.
-
 ```cuda
-template <const int BM, const int BN, const int BK, const int WM, const int WN, const int WNITER, const int TM, const int TN, const int NUM_THREADS>
-__global__ void __launch_bounds__(NUM_THREADS)
-sgemm_warp_tiling(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+template <const int BM, const int BN, const int BK, const int TM, const int TN>
+__global__ void sgemm_vectorized(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
   const int cRow = blockIdx.y;
   const int cCol = blockIdx.x;
 
   __shared__ float As[BK * BM];
   __shared__ float Bs[BK * BN];
 
-  const int warpIdx = threadIdx.x / WARPSIZE;
-  const int warpCol = warpIdx % (BN / WN);
-  const int warpRow = warpIdx / (BN / WN);
+  const int threadCol = threadIdx.x % (BN / TN);
+  const int threadRow = threadIdx.x / (BN / TN);
 
-  constexpr int WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);
-  constexpr int WSUBM = WM / WMITER;
-  constexpr int WSUBN = WN / WNITER;
+  A += cRow * BM * K;                   
+  B += cCol * BN;                       
+  C += cRow * BM * N + cCol * BN;       
 
-  const int threadIdxInWarp = threadIdx.x % WARPSIZE;
-  const int threadColInWarp = threadIdxInWarp % (WSUBN / TN);
-  const int threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
-
-  A += cRow * BM * K;
-  B += cCol * BN;
   
-  C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
+  const int innerRowA = threadIdx.x / (BK / 4);   
+  const int innerColA = threadIdx.x % (BK / 4);   
 
-  const int innerRowA = threadIdx.x / (BK / 4);
-  const int innerColA = threadIdx.x % (BK / 4);
-  constexpr int ROW_STRIDE_A = (NUM_THREADS * 4) / BK;
+  const int innerRowB = threadIdx.x / (BN / 4);   
+  const int innerColB = threadIdx.x % (BN / 4);   
 
-  const int innerRowB = threadIdx.x / (BN / 4);
-  const int innerColB = threadIdx.x % (BN / 4);
-  constexpr int ROW_STRIDE_B = NUM_THREADS / (BN / 4);
+  float threadResults[TM * TN] = {0.0f};
 
-  float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
-  float regM[WMITER * TM] = {0.0f};
-  float regN[WNITER * TN] = {0.0f};
+  float regM[TM] = {0.0f};
+  float regN[TN] = {0.0f};
 
   for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+
     
-    for (int offset = 0; offset + ROW_STRIDE_A <= BM; offset += ROW_STRIDE_A) {
-      float4 tmp = reinterpret_cast<const float4 *>(
-          &A[(innerRowA + offset) * K + innerColA * 4])[0];
-      As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
-      As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
-      As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
-      As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
-    }
-    for (int offset = 0; offset + ROW_STRIDE_B <= BK; offset += ROW_STRIDE_B) {
-      reinterpret_cast<float4 *>(&Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
-          reinterpret_cast<const float4 *>(&B[(innerRowB + offset) * N + innerColB * 4])[0];
-    }
+    float4 tmp = reinterpret_cast<const float4 *>(&A[innerRowA * K + innerColA * 4])[0];
+    As[(innerColA * 4 + 0) * BM + innerRowA] = tmp.x;
+    As[(innerColA * 4 + 1) * BM + innerRowA] = tmp.y;
+    As[(innerColA * 4 + 2) * BM + innerRowA] = tmp.z;
+    As[(innerColA * 4 + 3) * BM + innerRowA] = tmp.w;
+
+    reinterpret_cast<float4 *>(&Bs[innerRowB * BN + innerColB * 4])[0] =
+        reinterpret_cast<const float4 *>(&B[innerRowB * N + innerColB * 4])[0];
     __syncthreads();
 
     A += BK;
@@ -97,41 +71,34 @@ sgemm_warp_tiling(int M, int N, int K, float alpha, const float *A, const float 
 
     for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
 
-      for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow)
-        for (int i = 0; i < TM; ++i)
-          regM[wSubRow * TM + i] =
-              As[dotIdx * BM + warpRow * WM + wSubRow * WSUBM + threadRowInWarp * TM + i];
+      for (int i = 0; i < TM; ++i) {
+        regM[i] = As[dotIdx * BM + threadRow * TM + i];
+      }
+      for (int i = 0; i < TN; ++i) {
+        regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+      }
 
-      for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol)
-        for (int i = 0; i < TN; ++i)
-          regN[wSubCol * TN + i] =
-              Bs[dotIdx * BN + warpCol * WN + wSubCol * WSUBN + threadColInWarp * TN + i];
-
-      for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow)
-        for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol)
-          for (int m = 0; m < TM; ++m)
-            for (int n = 0; n < TN; ++n)
-              threadResults[(wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n] +=
-                  regM[wSubRow * TM + m] * regN[wSubCol * TN + n];
+      for (int resIdxM = 0; resIdxM < TM; ++resIdxM) {
+        for (int resIdxN = 0; resIdxN < TN; ++resIdxN) {
+          threadResults[resIdxM * TN + resIdxN] += regM[resIdxM] * regN[resIdxN];
+        }
+      }
     }
     __syncthreads();
   }
 
-  for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow) {
-    for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol) {
-      float *cSub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
-      for (int m = 0; m < TM; ++m) {
-        for (int n = 0; n < TN; n += 4) {
-          float *cPtr = &cSub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
-          float4 tmp = reinterpret_cast<float4 *>(cPtr)[0];
-          const int accIdx = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
-          tmp.x = alpha * threadResults[accIdx + 0] + beta * tmp.x;
-          tmp.y = alpha * threadResults[accIdx + 1] + beta * tmp.y;
-          tmp.z = alpha * threadResults[accIdx + 2] + beta * tmp.z;
-          tmp.w = alpha * threadResults[accIdx + 3] + beta * tmp.w;
-          reinterpret_cast<float4 *>(cPtr)[0] = tmp;
-        }
-      }
+  
+  for (int resIdxM = 0; resIdxM < TM; ++resIdxM) {
+    for (int resIdxN = 0; resIdxN < TN; resIdxN += 4) {
+      float *cPtr = &C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
+      float4 tmp = reinterpret_cast<float4 *>(cPtr)[0];
+
+      tmp.x = alpha * threadResults[resIdxM * TN + resIdxN + 0] + beta * tmp.x;
+      tmp.y = alpha * threadResults[resIdxM * TN + resIdxN + 1] + beta * tmp.y;
+      tmp.z = alpha * threadResults[resIdxM * TN + resIdxN + 2] + beta * tmp.z;
+      tmp.w = alpha * threadResults[resIdxM * TN + resIdxN + 3] + beta * tmp.w;
+
+      reinterpret_cast<float4 *>(cPtr)[0] = tmp;
     }
   }
 }
@@ -139,56 +106,46 @@ sgemm_warp_tiling(int M, int N, int K, float alpha, const float *A, const float 
 
 ### Mechanics
 
-1. **The index chain now has three links, and each one is a pointer offset or an added term.** The block's corner is folded into `A`, `B` and `C` as before. The warp's corner is folded into `C` as well, `(cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN`, so the epilogue never mentions the block again. Inside the loop, `warpRow * WM + wSubRow * WSUBM + threadRowInWarp * TM + i` reads as exactly what it is: block tile, then warp tile, then sub-tile, then thread patch, then element.
+1. **`As` and `Bs` swap their declared shapes, and only one of them is a real transpose.** `As` is now `BK * BM` and is indexed `[k][m]`, which is the transpose of kernel 6's `[m][k]`. `Bs` is still `BK * BN` indexed `[k][n]`, unchanged; it was already oriented the way its readers want. If you only remember one thing about this kernel, it is that A gets transposed and B does not, and the reason is that A is the operand whose thread tile runs down the M dimension.
 
-2. **The accumulators are the same 64 as kernel 7, indexed differently.** `threadResults[WMITER * TM * WNITER * TN]` is `2 * 4 * 2 * 4 = 64` values, the same register footprint as an `8 x 8` patch, but laid out as four `4 x 4` patches scattered across the warp tile rather than one contiguous `8 x 8`. `ptxas` reports 96 registers per thread against kernel 7's 94, so the third level of tiling costs two registers.
+2. **The load loops disappear.** Each thread now moves a `float4`, and 256 threads times 4 floats is exactly the 1024 elements in each tile, so kernel 6's four pass loops collapse into a single statement each. `innerColA` ranges over `BK / 4 = 2` values and `innerRowA` over 128; `innerColB` ranges over `BN / 4 = 32` and `innerRowB` over 8. Both still put the column index on the fast moving lane, so both global reads are still perfectly coalesced.
 
-3. **The load loops come back, with different trip counts.** `ROW_STRIDE_A = (NUM_THREADS * 4) / BK = 32`, and `BM / ROW_STRIDE_A = 4` passes to fill `As`. `ROW_STRIDE_B = NUM_THREADS / (BN / 4) = 8`, and `BK / ROW_STRIDE_B = 2` passes for `Bs`. The loop bound is written `offset + ROW_STRIDE_A <= BM` rather than `offset < BM`, which matters only when the stride does not divide the tile, and in that case it silently loads less than the full tile instead of overrunning it. That is a config bug rather than a runtime one, and again, nothing here checks.
+3. **The A store is four scalar stores and cannot be anything else.** `tmp.x` through `tmp.w` go to four addresses `BM` floats apart, so there is no vector store to be had on that side. This is the price of the transpose, paid once per tile per thread, against a saving collected `BK` times per tile in the inner loop.
 
-4. **`__launch_bounds__` appears for the first time.** It promises the compiler that no more than `NUM_THREADS` threads will ever be launched in a block, which lets `ptxas` size the register allocation against a known block size. It is doing modest work here. In the final kernel, the second argument to this same declaration turns out to be the largest single win in the series.
+4. **The epilogue reads C back as a `float4` and writes it back as one.** `beta * C` still requires reading the old value, but a thread's `TN = 8` outputs in a row are contiguous in C, so the read modify write goes four elements at a time. This is also the first appearance of a requirement that becomes load bearing two kernels from now: everything here assumes `TN`, `BN` and `BK` are multiples of 4 and that the pointers are 16 byte aligned. Nothing checks it yet, and a config that violates it does not fail loudly, it computes garbage.
 
-Kernel 8 runs in **4.679 ms at 29376.6 GFLOP/s, which is 81.6% of cuBLAS at `M = N = K = 4096`**, up from 5.469 ms and 69.8%. That is 1.17 times faster.
+5. **The listing reads `regM` and `regN` with scalar loops on purpose.** Because the addresses are now contiguous and 16 byte aligned, `ptxas` fuses each group of four into a single `LDS.128` by itself. Writing the `float4` cast by hand here changes nothing in the generated SASS, and the scalar form survives a change of `TM` without editing. The transpose is what produced the win; the vector instruction is what the compiler does once the transpose makes it legal.
 
-### The Arithmetic, As A Negative Result
+Kernel 7 runs in **5.469 ms at 25130.5 GFLOP/s, which is 69.8% of cuBLAS at `M = N = K = 4096`**, up from 6.996 ms and 54.6%. That is 1.28 times faster with no change to the tiling, the thread count, or the number of bytes touched.
 
-Now the uncomfortable part. Put this kernel's tile shape through the formula from the 2D register tiling section:
+This kernel also has the widest run to run spread in the series, 3.24% against well under 1% for its neighbours, so treat the last decimal place as noise rather than signal.
 
-```
-GMEM accesses per result = K * (1/BM + 1/BN)
-                         = 4096 * (1/128 + 1/64)
-                         = 96
-```
+### Instructions, Not Bytes
 
-against 64 for kernel 7's square `128 x 128` tile. Total global load traffic goes from **4.29 GB to 6.44 GB**, an increase of 50%. The shared memory count does not improve either: `WMITER * TM + WNITER * TN = 16` loads per `dotIdx` feeding `8 x 8 = 64` results is `K / 4 = 1024` per output element, identical to kernels 6 and 7.
+The counts from kernel 6 all carry over exactly. Global memory is still 64 accesses per output element and 4.29 GB in total. Shared memory is still `K x (1/TM + 1/TN) = 1024` floats read per output element. Arithmetic intensity is still 32 FLOP per byte, the roofline position has not moved, and the memory and compute floors are the 4.47 ms and 2.44 ms they were before.
 
-Neither access count improved. One of them got materially worse. The kernel is 1.17 times faster.
+What changed is the instruction count carrying those bytes:
 
-This is worth sitting with, because the formula that says this config is bad is the same formula that has been correct for four kernels running. It says square tiles minimize traffic for a given area, and it is right about that. What it does not model is anything else on the machine:
+| per thread, per `dotIdx` | kernel 6 | kernel 7 |
+|---|---|---|
+| `LDS` from `As` | 8 x 32 bit | 2 x 128 bit |
+| `LDS` from `Bs` | 8 x 32 bit | 2 x 128 bit |
+| `FFMA` | 64 | 64 |
+| shared loads per FMA | 1 per 4 | 1 per 16 |
 
-- **Residency.** Kernel 7 ran 256 threads with 93 registers each, giving 2 blocks per SM and 33.3% occupancy. This kernel runs 128 threads with 96 registers, giving **5 blocks per SM** and 41.7%. Smaller blocks pack more of them onto an SM, and more resident blocks means the barriers cost less, because when one block stalls at `__syncthreads()` there are four others with work to issue.
-- **Warp locality.** Each shared memory instruction now touches a 16 or 32 float range instead of a 128 float one, which was the entire point of the section.
-- **Issue pressure.** Nsight puts this kernel at 7.08 warp cycles per issued instruction, and for the first time in the series the largest stall reason it names is `Stall Not Selected`, at 38.1%: warps that were eligible and simply were not picked that cycle. That is what having enough work looks like, and every kernel from here shares the signature.
-- **L2.** The extra 2.15 GB of requests is only expensive if it reaches DRAM, and on this card it does not have to. A block row band of A is `BM x K x 4 = 2 MB`, and the L2 is 64 MB.
+Counted per output element, shared memory load instructions go from `K / 4` to `K / 16`, four times fewer, and the global side sees the same fourfold reduction in `LDG` and `STG` instructions for identical traffic. If a description of this kernel says vectorization moves less data, it is wrong. It moves precisely the same data with a quarter of the instructions, and the thing that was scarce was instruction issue.
 
-That last point deserves a number, because it is where the roofline stops being useful.
+Nsight puts numbers on the issue side of that. Kernel 6 runs at 7.49 warp cycles per issued instruction and this kernel at **6.37**, and neither has a stall reason large enough for the profiler to name one. The instruction count fell fourfold and the cost of issuing what remains fell with it.
 
-### Retiring The Roofline
-
-Arithmetic intensity falls this time, from 32 to `137.44 GFLOP / 6.44 GB = 21.3 FLOP/byte`, so the model says we have moved backwards. Its predictions:
-
-- The sloped ceiling at 21.3 FLOP/byte sits at `21.3 x 960 GB/s = 20486 GFLOP/s`. We measured **29376.6**, which is 143% of the roof.
-- The memory floor for 6.44 GB at 960 GB/s is **6.71 ms**. We measured **4.679 ms**, which is faster than the floor.
-
-The kernel beats its own roofline in both forms, and by now the reason is familiar, because kernel 1 did the same thing for the same reason. The model assumes every requested byte comes from VRAM. Here it does not: at 4096 the working set fits the 64 MB L2 well enough that the extra requests this tile shape generates are served on chip, and the DRAM never sees them.
-
-That is the third and final time this model earns its keep in the series, and it earns it by failing. It was the right tool at kernel 1, where it explained a 234 times intensity deficit; it was the right tool at kernel 4, where the kernel first sat underneath it; and it is the wrong tool from here on, because every remaining bottleneck is inside the SM. The traffic accounting that would still be informative is against L2 rather than DRAM, and `lts__t_sector_hit_rate.pct` is the metric that would settle it.
+<!-- TODO: smsp__inst_executed.sum on kernels 6 and 7, to state the instruction
+     reduction as measured rather than derived. WarpStateStats is done. -->
 
 ### What Could Be Improved
 
-There is nothing wrong with this kernel that a better argument would fix, which is precisely the problem.
+The transpose bought the loads and quietly created a problem on the stores. Shared memory is divided into 32 banks by `(byte address / 4) mod 32`, and two lanes of the same warp hitting different addresses in the same bank serialize. The store is `As[(innerColA * 4 + j) * BM + innerRowA]`, and with `BM = 128`, which is a multiple of 32, the entire first term vanishes from the bank index. Every lane's bank is just `innerRowA mod 32`.
 
-The tile shape `128 x 64` with `BK = 16` and a `4 x 4` thread tile is not what any of the reasoning in this series would have chosen. The access count formula picks square. The register argument from the 2D tiling section picks the largest thread tile that does not spill, which is `8 x 8`, not `4 x 4`. Both arguments are sound, both were load bearing when they were made, and both would have landed on kernel 7's config, which is 17% slower.
+With `BK = 8` a warp's 32 lanes cover `innerRowA = threadIdx.x / 2`, which is 16 distinct rows, so the warp's stores land on 16 banks and every bank takes two of them. That is a 2-way conflict on all four of the A stores, and it gets worse rather than better as `BK` grows, because a wider `BK` means fewer distinct rows per warp. The next kernel raises `BK` to 16, and the same expression then covers only 8 rows.
 
-The honest summary of this section is that the shape came from measurement, and the reasoning was reconstructed afterwards to explain a result it did not predict. That is not a failure of the reasoning so much as a statement about how many interacting resources are in play: registers, residency, bank behaviour, L2, and instruction issue all move when a tile dimension moves, and no closed form covers all five.
+There is a second and larger problem, and it is about which values a warp reads rather than where it writes them. A warp is 32 consecutive threads, and `threadRow = threadIdx.x / 16` with `threadCol = threadIdx.x % 16`, so one warp spans 16 columns and 2 rows of the thread grid, which is `16 x 8 = 128` columns and `2 x 8 = 16` rows of the output tile. Its reads out of `Bs` therefore span the entire 128 wide tile, and its reads out of `As` span 16 rows sitting in the middle of a 128 row structure. The warp is smeared across the block tile, and every shared memory instruction it issues touches a wide strided range instead of a compact one.
 
-So stop arguing about the configuration and search it instead.
+Nothing in the code decides that shape deliberately. It falls out of `threadIdx.x` being cut into rows of 16, which was never a decision at all. The next kernel makes it one.

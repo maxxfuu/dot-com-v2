@@ -10,7 +10,7 @@ summary: "Understanding GPU hardware, CUDA's execution and memory models, and pr
 
 In this article, I will walk you through how to write a CUDA matrix multiplication naive kernel and optimizing it to reach ~97% of SGEMM cuBLAS kernel. 
 
-![Every kernel in this article, benchmarked on an RTX 5080 at M=N=K=4096, alpha=1 and beta=0. Each row is the median of 7 trials of 5 reps after a 300 ms warm-up, with the run-to-run spread and the max relative error against cuBLAS alongside it. The ladder runs from the naive kernel at 410.5 GFLOP/s and 1.1% of cuBLAS up to the final tuned kernel at 34978.3 GFLOP/s and 97.1%. cuBLAS was re-timed after the sweep and drifted 0.13%, so the percentage column is sound.](/images/gemm/kernel-benchmark.png)
+![Every kernel in this article, benchmarked on an RTX 5080 at M=N=K=4096, alpha=1 and beta=0. Each row is the median of 7 trials of 5 reps after a 300 ms warm-up, with the run-to-run spread and the max relative error against cuBLAS alongside it. The ladder runs from the naive kernel at 410.5 GFLOP/s and 1.1% of cuBLAS up to the final tuned kernel at 34978.3 GFLOP/s and 97.1%. cuBLAS was re-timed after the sweep and drifted 0.13%, so the percentage column is sound.](/images/gemm/kernel-benchmark.png "full")
 
 Learning CUDA has been an incredible and exciting journey. While learning CUDA has become easier over the past few years, most resources remain difficult to digest. 
 
@@ -26,18 +26,19 @@ Below is the table of contents, feel free to skip around although reading this s
 
 ### To write a CUDA Matmul Kernel That Reaches 97% of cuBLAS Performance
 1. [From CUDA Hardware Architecture to CUDA Kernels](/writings/article4/page2)
-2. [The Naive Kernel: Establishing a Baseline](/writings/article4/page3)
-3. [Global Memory Coalescing](/writings/article4/page4)
-4. [Flattening the Block](/writings/article4/page5)
-5. [Shared Memory Tiling](/writings/article4/page6)
-6. [1D Register Tiling: One Thread, TM Outputs](/writings/article4/page7)
-7. [2D Register Tiling: The Outer Product](/writings/article4/page8)
-8. [Vectorized Memory Access: 128-bit Loads and Stores](/writings/article4/page9)
-9. [Warp Tiling: A Third Level of Tiling](/writings/article4/page10)
-10. [Autotuning: Searching the Tile-Shape Space](/writings/article4/page11)
-11. [Padded Shared Memory: Eliminating Bank Conflicts](/writings/article4/page12)
-12. [Double Buffering: Software Pipelining the K-Loop](/writings/article4/page13)
-13. [The Final Kernel: Retuning Against the Pipeline](/writings/article4/page14)
+2. [The Roofline Model and GEMM](/writings/article4/page3)
+3. [The Naive Kernel: Establishing a Baseline](/writings/article4/page4)
+4. [Global Memory Coalescing](/writings/article4/page5)
+5. [Flattening the Block](/writings/article4/page6)
+6. [Shared Memory Tiling](/writings/article4/page7)
+7. [1D Register Tiling: One Thread, TM Outputs](/writings/article4/page8)
+8. [2D Register Tiling: The Outer Product](/writings/article4/page9)
+9. [Vectorized Memory Access: 128-bit Loads and Stores](/writings/article4/page10)
+10. [Warp Tiling: A Third Level of Tiling](/writings/article4/page11)
+11. [Autotuning: Searching the Tile-Shape Space](/writings/article4/page12)
+12. [Padded Shared Memory: Eliminating Bank Conflicts](/writings/article4/page13)
+13. [Double Buffering: Software Pipelining the K-Loop](/writings/article4/page14)
+14. [The Final Kernel: Retuning Against the Pipeline](/writings/article4/page15)
 
 
 This writing was inspired by blogs such as Simons writing on this exact topic[^1]. Abhik's[^2] and Robert's[^3] on this topic is what cemented these concepts for me. The reset of my knowledge gap was filed with reading PMPP [^4], Modals' GPU Glossary[^5], and a lot of tokens.

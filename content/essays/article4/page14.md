@@ -1,222 +1,247 @@
-## The Final Kernel: Retuning Against the Pipeline
+## Double Buffering: Software Pipelining the K-Loop
 
-Kernel 11 closed on a problem with no code in it. Its tile shape was chosen by a sweep over the non-pipelined kernel, and its shared memory padding came from a profiler reading taken when the thread tile was `4 x 4`. Both decisions were correct when they were made, and pipelining the K loop invalidated both without changing a line of either.
+Kernel 10 ended with almost nothing left to remove. Roughly 95% of the instructions issued per K-tile are `FFMA`, the loads are vectorized, the tile shape is the best of a measured sweep, and the bank conflicts are gone. And it is still at 81.9% of cuBLAS.
 
-This section has no new technique in it at all. There is no new instruction, no new level of tiling, no stage the previous kernel did not already have. What changes is four constants and one compiler declaration, and together they close most of the remaining gap to cuBLAS.
+What is left is not work, it is waiting. The K loop has had the same four beats since kernel 4:
 
-That is worth saying plainly, because it is the least satisfying and most transferable result in the article: at this point in the ladder, the returns are no longer in the ideas.
-
-### What Pipelining Changed About Scarcity
-
-Before the pipeline, the K loop was `load, sync, compute, sync`, and every barrier stalled the whole block. The way to survive that is to have other blocks resident, so the search that produced the `128 x 64` shape was implicitly optimizing for occupancy, and it correctly picked small blocks that pack five to an SM.
-
-After the pipeline there is one barrier per tile and the loads for the next tile are already in flight during this tile's arithmetic. Occupancy stops paying for itself, because the latency it was hiding is now hidden by the pipeline instead. What matters in its place is how much arithmetic each thread has available to issue between its shared memory loads, which is instruction level parallelism per thread, and that is bought with registers.
-
-The two are in direct competition, since registers are what limits how many blocks fit. So the same search run against the pipelined kernel walks in the opposite direction: fewer, fatter threads.
-
-Widening the thread tile from `4 x 4` to `16 x 4` and doubling `BN` back to 128 changes the inner loop ratio:
-
-| config | SMEM loads per `dotIdx` | FMAs per `dotIdx` | FMA per float loaded |
-|---|---|---|---|
-| `T4x4`, WNITER 2 (kernel 11) | 8 + 8 = 16 | 64 | 4.0 |
-| `T16x4`, WNITER 2 (here) | 16 + 8 = 24 | 128 | 5.3 |
-
-And because `TM = 16` reads 16 *contiguous* floats out of the transposed `As`, that side of the load is four `LDS.128` rather than sixteen `LDS.32`. The inner loop ends up issuing six vector shared memory loads to feed 128 FMAs.
-
-### The Padding Has To Go
-
-The same widening un-does the previous section. The bank conflict on the transposed store is still real, and the derivation in that section is still correct: `BM = 128` is a multiple of 32, the column term drops out of the bank index, and a warp's stores land on 8 banks.
-
-What changed is the ratio between the two paths. Per K-tile this kernel issues:
-
-| instruction | count per K-tile |
-|---|---|
-| `STS`, the conflicting transposed stores | 16 |
-| `LDS.128`, the vector loads feeding the FMAs | 96 |
-| `FFMA` | 2048 |
-
-The conflicting stores are 0.7% of the instruction stream, which is what the previous section already established. The new problem is that the padding is not free on the other side. `A_STRIDE = 130` is not a multiple of 4, so `dotIdx * A_STRIDE` is only 8 byte aligned on odd `dotIdx`, and a `LDS.128` cannot issue against an 8 byte aligned address. Half of those 96 vector loads split into pairs of `LDS.64`. Kernel 11's SASS shows exactly that: 96 `LDS.128` and an extra 64 `LDS.64` that should not exist.
-
-So the padding pays a tax on the hot path, 96 loads per tile, to fix a conflict on the cold one, 16 stores per tile. Removing it is measurably faster, and `A_STRIDE` becomes `BM`:
-
-```cuda
-constexpr int A_STRIDE = BM;
+```
+load a tile into shared memory
+__syncthreads()
+compute 16 steps out of shared memory
+__syncthreads()
 ```
 
-This is the most useful single fact in the article. A profiler-driven fix, correctly derived and correctly measured, became a pessimization four kernels later, and nothing about the padded kernel itself changed to signal it. Its premise expired.
+Those two barriers make the two halves mutually exclusive. While the block is issuing global loads, the FMA pipes have nothing to do, because the data they would need is exactly what is being fetched. While the block is computing, the load pipes have nothing to do. Every SM alternates between two idle resources when it could be using both.
 
-### Skipping The Read Of C
+Residency has been papering over this. With 5 blocks per SM, one block stalling at a barrier leaves four others with work to issue, which is a large part of why kernel 8's small blocks beat kernel 7's large ones. But that is latency hiding across blocks, and it only works while there are spare blocks.
 
-There is one saving here that is not a retune. Every kernel since the 2D register tiling section ends with the same epilogue:
+The direct fix is to overlap the two phases within a single block. Keep two tiles in shared memory instead of one. Compute on tile `n` while the loads for tile `n + 1` are already in flight, then swap. The loads still cost what they cost; they just happen underneath the arithmetic instead of in front of it.
+
+### Two Stages, One Barrier
+
+Doubling the buffers is what makes the barrier count fall, and the reason is worth stating precisely, because it is the entire correctness argument for the kernel.
+
+With one buffer, the second `__syncthreads()` exists to stop a fast warp from overwriting the tile a slow warp is still reading. With two buffers that hazard is gone by construction: warps read from `As[curStage]` and write into `As[nextStage]`, which are different memory. The only remaining hazard is the original one, that a warp might read a stage before every warp has finished filling it, and that needs one barrier per trip rather than two.
+
+The other half of the mechanism is `cp.async`, which is a Blackwell-era instruction that copies from global memory straight into shared memory without the data passing through registers or through the warp at all. Issue it, keep going, and check later that it landed:
 
 ```cuda
-float4 tmp = reinterpret_cast<float4 *>(cPtr)[0];   // read C back
-tmp.x = alpha * threadResults[accIdx + 0] + beta * tmp.x;
-```
+__device__ __forceinline__ void cp_async16(float *smemDst, const float *gmemSrc) {
+  const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smemDst));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(addr), "l"(gmemSrc));
+}
 
-When `beta == 0` that read is pure waste. The value loaded is multiplied by zero and thrown away, and it costs a full pass over C: `M x N x 4 = 67 MB` of DRAM reads that cannot hit in L2, because C is 67 MB against a 64 MB cache and is streamed exactly once. At 960 GB/s that is roughly 70 microseconds on a 4 ms kernel, and the measured gain is larger than that, because those loads also occupy issue slots in the epilogue.
+__device__ __forceinline__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
 
-The choice is made once on the host rather than once per thread, with the kernel templated on a `bool` and both instantiations compiled:
-
-```cuda
-if constexpr (BETA_IS_ZERO) {
-  // build the float4 and store it, no read of C at all
-} else {
-  // the kernel 11 epilogue
+template <int PENDING>
+__device__ __forceinline__ void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(PENDING));
 }
 ```
 
-This is not a benchmark artifact. `beta == 0` is the case in essentially every GEMM inside a neural network forward pass, and cuBLAS special cases it for the same reason. The kernel stays fully general in `beta`; the fast path is a fast path, not a restriction.
-
-### The Declaration That Was Worth More Than Any Of It
-
-Every kernel in this series from warp tiling onwards is declared `__launch_bounds__(NUM_THREADS)`. This one is declared `__launch_bounds__(NUM_THREADS, 1)`, and that second argument is the single largest change in the file:
-
-| declaration | registers | throughput |
-|---|---|---|
-| `__launch_bounds__(NT)` | 202 | 90.0% |
-| `__launch_bounds__(NT, 1)` | **227** | **95.7 to 95.9%** |
-
-The one argument form only tells `ptxas` the maximum block size. It is then free to apply its own heuristic about how many blocks it would like to fit per SM, and that heuristic is written for kernels that want occupancy. It duly holds this kernel to 202 registers trying to fit a third block on each SM. The second argument, `minBlocksPerMultiprocessor = 1`, tells it the truth: one block per SM is fine here, so stop rationing.
-
-Note the direction. We are asking for lower occupancy on purpose, and the flag that delivers it is the one that sounds like it is asking for less. The 227 registers that make the wide thread tile work are not something the configuration produces on its own. They have to be permitted.
-
-`ptxas` reports 0 bytes spilled at 227 registers, and that headroom is the only reason this configuration is legal. It is worth re-checking with `-Xptxas -v` after any edit, because the cliff on the other side of it is very steep.
+`cp.async` copies bytes verbatim, which is precisely why only B can use it. `Bs` is stored in the same orientation it is read from global memory, so a straight byte copy is correct. `As` is stored transposed, and a transpose is not a copy: the four floats of a `float4` have to end up in four different rows, `A_STRIDE` apart. That has to pass through a register. So A is prefetched into a `float4` register array early in the loop and written into shared memory late, and B goes global to shared directly with no register involvement.
 
 ### The Kernel
 
-```cuda
-const int BM = 128, BN = 128, BK = 16, WM = 64, WN = 64, WNITER = 2;
-const int TM = 16, TN = 4, NT = 128;
+The configuration is unchanged from kernels 8 and 10, including the `A_STRIDE` padding inherited from the previous section:
 
-dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM), 1);
-dim3 blockDim(NT);
+```cuda
+const int BM = 128, BN = 64, BK = 16;
+const int WM = 64, WN = 32, WNITER = 2;
+const int TM = 4, TN = 4, NUM_THREADS = 128;
 ```
 
 ```cuda
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
-          const int WNITER, const int TM, const int TN, const int NUM_THREADS,
-          const bool BETA_IS_ZERO>
-__global__ void __launch_bounds__(NUM_THREADS, 1)
-sgemm_final(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+          const int WNITER, const int TM, const int TN, const int NUM_THREADS>
+__global__ void __launch_bounds__(NUM_THREADS)
+sgemm_double_buffered(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
   const int cRow = blockIdx.y;
   const int cCol = blockIdx.x;
 
-  constexpr int A_STRIDE = BM;
+  
+  constexpr int A_STRIDE = BM + (32 / BK) % 8;
 
   __shared__ float As[2][BK * A_STRIDE];
   __shared__ float Bs[2][BK * BN];
 
-  // ... prologue, main loop and staging are kernel 11's, unchanged ...
+  const int warpIdx = threadIdx.x / WARPSIZE;
+  const int warpCol = warpIdx % (BN / WN);
+  const int warpRow = warpIdx / (BN / WN);
 
-  if constexpr (BETA_IS_ZERO) {
-    for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow) {
-      for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol) {
-        float *cSub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
-        for (int m = 0; m < TM; ++m) {
-          for (int n = 0; n < TN; n += 4) {
-            float *cPtr = &cSub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
-            const int accIdx = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
-            float4 out;
-            out.x = alpha * threadResults[accIdx + 0];
-            out.y = alpha * threadResults[accIdx + 1];
-            out.z = alpha * threadResults[accIdx + 2];
-            out.w = alpha * threadResults[accIdx + 3];
-            reinterpret_cast<float4 *>(cPtr)[0] = out;
-          }
+  constexpr int WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);
+  constexpr int WSUBM = WM / WMITER;
+  constexpr int WSUBN = WN / WNITER;
+
+  const int threadIdxInWarp = threadIdx.x % WARPSIZE;
+  const int threadColInWarp = threadIdxInWarp % (WSUBN / TN);
+  const int threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
+
+  A += cRow * BM * K;
+  B += cCol * BN;
+  C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
+
+  const int innerRowA = threadIdx.x / (BK / 4);
+  const int innerColA = threadIdx.x % (BK / 4);
+  constexpr int ROW_STRIDE_A = (NUM_THREADS * 4) / BK;
+  constexpr int A_PASSES = BM / ROW_STRIDE_A;
+
+  const int innerRowB = threadIdx.x / (BN / 4);
+  const int innerColB = threadIdx.x % (BN / 4);
+  constexpr int ROW_STRIDE_B = NUM_THREADS / (BN / 4);
+
+  float4 aFrag[A_PASSES];
+
+  float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
+  float regM[WMITER * TM] = {0.0f};
+  float regN[WNITER * TN] = {0.0f};
+
+#pragma unroll
+  for (int pass = 0; pass < A_PASSES; ++pass)
+    aFrag[pass] = reinterpret_cast<const float4 *>(
+        &A[(innerRowA + pass * ROW_STRIDE_A) * K + innerColA * 4])[0];
+#pragma unroll
+  for (int pass = 0; pass < A_PASSES; ++pass) {
+    const int row = innerRowA + pass * ROW_STRIDE_A;
+    As[0][(innerColA * 4 + 0) * A_STRIDE + row] = aFrag[pass].x;
+    As[0][(innerColA * 4 + 1) * A_STRIDE + row] = aFrag[pass].y;
+    As[0][(innerColA * 4 + 2) * A_STRIDE + row] = aFrag[pass].z;
+    As[0][(innerColA * 4 + 3) * A_STRIDE + row] = aFrag[pass].w;
+  }
+#pragma unroll
+  for (int offset = 0; offset + ROW_STRIDE_B <= BK; offset += ROW_STRIDE_B)
+    cp_async16(&Bs[0][(innerRowB + offset) * BN + innerColB * 4],
+               &B[(innerRowB + offset) * N + innerColB * 4]);
+  cp_async_commit();
+  cp_async_wait<0>();
+  __syncthreads();
+
+  const int numTiles = K / BK;
+  int curStage = 0;
+  for (int tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
+    const int nextStage = curStage ^ 1;
+    const bool hasNextTile = (tileIdx + 1) < numTiles;
+
+    if (hasNextTile) {
+
+      const float *aNext = A + (tileIdx + 1) * BK;
+      const float *bNext = B + (long)(tileIdx + 1) * BK * N;
+#pragma unroll
+      for (int pass = 0; pass < A_PASSES; ++pass)
+        aFrag[pass] = reinterpret_cast<const float4 *>(
+            &aNext[(innerRowA + pass * ROW_STRIDE_A) * K + innerColA * 4])[0];
+#pragma unroll
+      for (int offset = 0; offset + ROW_STRIDE_B <= BK; offset += ROW_STRIDE_B)
+        cp_async16(&Bs[nextStage][(innerRowB + offset) * BN + innerColB * 4],
+                   &bNext[(innerRowB + offset) * N + innerColB * 4]);
+      cp_async_commit();
+    }
+
+#pragma unroll
+    for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+#pragma unroll
+      for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow)
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+          regM[wSubRow * TM + i] =
+              As[curStage][dotIdx * A_STRIDE + warpRow * WM + wSubRow * WSUBM + threadRowInWarp * TM + i];
+#pragma unroll
+      for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol)
+#pragma unroll
+        for (int i = 0; i < TN; ++i)
+          regN[wSubCol * TN + i] =
+              Bs[curStage][dotIdx * BN + warpCol * WN + wSubCol * WSUBN + threadColInWarp * TN + i];
+#pragma unroll
+      for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow)
+#pragma unroll
+        for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol)
+#pragma unroll
+          for (int m = 0; m < TM; ++m)
+#pragma unroll
+            for (int n = 0; n < TN; ++n)
+              threadResults[(wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n] +=
+                  regM[wSubRow * TM + m] * regN[wSubCol * TN + n];
+    }
+
+    if (hasNextTile) {
+      
+#pragma unroll
+      for (int pass = 0; pass < A_PASSES; ++pass) {
+        const int row = innerRowA + pass * ROW_STRIDE_A;
+        As[nextStage][(innerColA * 4 + 0) * A_STRIDE + row] = aFrag[pass].x;
+        As[nextStage][(innerColA * 4 + 1) * A_STRIDE + row] = aFrag[pass].y;
+        As[nextStage][(innerColA * 4 + 2) * A_STRIDE + row] = aFrag[pass].z;
+        As[nextStage][(innerColA * 4 + 3) * A_STRIDE + row] = aFrag[pass].w;
+      }
+      cp_async_wait<0>();
+      __syncthreads();   
+    }
+    curStage = nextStage;
+  }
+
+  for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow) {
+    for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol) {
+      float *cSub = C + (wSubRow * WSUBM) * N + wSubCol * WSUBN;
+      for (int m = 0; m < TM; ++m) {
+        for (int n = 0; n < TN; n += 4) {
+          float *cPtr = &cSub[(threadRowInWarp * TM + m) * N + threadColInWarp * TN + n];
+          float4 tmp = reinterpret_cast<float4 *>(cPtr)[0];
+          const int accIdx = (wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n;
+          tmp.x = alpha * threadResults[accIdx + 0] + beta * tmp.x;
+          tmp.y = alpha * threadResults[accIdx + 1] + beta * tmp.y;
+          tmp.z = alpha * threadResults[accIdx + 2] + beta * tmp.z;
+          tmp.w = alpha * threadResults[accIdx + 3] + beta * tmp.w;
+          reinterpret_cast<float4 *>(cPtr)[0] = tmp;
         }
       }
     }
-  } else {
-    // kernel 11's epilogue, which reads C back for the beta term
   }
-}
-
-template <const int BM, const int BN, const int BK, const int WM, const int WN,
-          const int WNITER, const int TM, const int TN, const int NUM_THREADS>
-void launch_sgemm_final(int M, int N, int K, float alpha, const float *A,
-                        const float *B, float beta, float *C) {
-  dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM), 1);
-  dim3 blockDim(NUM_THREADS);
-  if (beta == 0.0f)
-    sgemm_final<BM, BN, BK, WM, WN, WNITER, TM, TN, NUM_THREADS, true>
-        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
-  else
-    sgemm_final<BM, BN, BK, WM, WN, WNITER, TM, TN, NUM_THREADS, false>
-        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 ```
 
 ### Mechanics
 
-1. **`WMITER` collapses to 1.** With `WM = WN = 64`, `TM = 16`, `TN = 4` and `WNITER = 2`, the derived `WMITER = (64 x 64) / (32 x 16 x 4 x 2) = 1`, so `WSUBM = WM = 64` and the warp covers its rectangle in a single pass down the M dimension. The per warp thread grid is `(WSUBM / TM) x (WSUBN / TN) = 4 x 8 = 32`. The three level tiling machinery from the warp tiling section is all still there, with one of its loops having degenerated to a single iteration.
+1. **The prologue is the loop body with the compute removed.** Before the loop can compute on stage 0, something has to fill stage 0, and that is what the three blocks above `numTiles` do. This is the structural cost of software pipelining: the steady state is efficient, and you pay for it with a prologue that has no arithmetic to overlap with, once per block rather than once per tile.
 
-2. **128 accumulators per thread.** `WMITER x TM x WNITER x TN = 1 x 16 x 2 x 4 = 128` floats live in registers for the whole kernel, exactly the ceiling the autotuner's `cfg_valid()` allows before spilling is certain. This is the config sitting on that boundary rather than near it.
+2. **The A prefetch and the A store sit on opposite sides of the compute.** `aFrag` is loaded from global memory at the top of the iteration and written into `As[nextStage]` at the bottom, with 2048 FMAs in between. That gap is the point. A global load has a latency of several hundred cycles, and the arithmetic in the middle is what covers it. Moving those two loops next to each other would compile, run, produce identical results, and lose most of the benefit of the section.
 
-3. **The block is still 128 threads, and the grid is now `32 x 32`.** That is 1024 blocks over 84 SMs, about 12 waves deep. Small grids are where scheduling effects and tail effects show up, and this is the point at which block rasterization schemes start being suggested. It was tried here and did nothing, because at 12 waves L2 already captures the reuse those schemes are designed to create.
+3. **`cp_async_wait<0>()` waits for all outstanding groups, and the placement matters more than the argument.** It sits immediately before the barrier at the end of the iteration, so the B copies for tile `n + 1` have the entire compute phase to complete in. The `commit_group` right after issuing them is what makes them a group that can be waited on.
 
-Kernel 12 runs in **3.929 ms at 34978.3 GFLOP/s, which is 97.1% of cuBLAS at `M = N = K = 4096`**, up from 4.281 ms and 89.2%. That is 9.0% faster than the double buffered kernel and 85 times faster than the naive one.
+4. **`cur ^ 1` rather than `(cur + 1) % 2`.** Both work with two stages. The XOR makes it obvious that the two indices are a pair being swapped rather than a counter being advanced, which matters if the stage count ever goes to 3 and the XOR stops being correct.
 
-### Where The Points Came From
+5. **`#pragma unroll` on everything.** Every loop in the hot path has a compile-time trip count, and unrolling them is what lets `ptxas` interleave the independent global loads, shared loads and FMAs into a single scheduled block. Without it the pipelining is expressed in the source and then thrown away by the scheduler.
 
-Measured cumulatively, adding one change at a time to the double buffered kernel:
+Kernel 11 runs in **4.281 ms at 32107.5 GFLOP/s, which is 89.2% of cuBLAS at `M = N = K = 4096`**, up from 4.660 ms and 81.9%. That is 8.9% faster.
 
-| | share of cuBLAS |
-|---|---|
-| kernel 11 as shipped | 85.5 to 86.4% |
-| plus the `beta == 0` epilogue | 88.6% |
-| plus the retune to `BN = 128`, `T8x8` | 90.3 to 91.4% |
-| plus the retune to `T16x4`, unpadded | 94.2 to 95.1% |
-| plus `__launch_bounds__` min-blocks = 1 | 95.7 to 95.9% |
+### What The Overlap Cost
 
-Those percentages come from an earlier benchmark run than the results table at the top of this article, so the absolute values are a point or two below the 97.1% quoted above and should be read as a shape rather than as figures. The clocks were not pinned, so any gap under about one point in that column is noise.
+This is the first optimization in the series that does not reduce anything. Global accesses per output element are still 96 and shared accesses are still `K / 4`, exactly as they were for kernels 8 and 10. The instruction mix is nearly identical. The only thing that changed is when the instructions issue relative to one another, so the accounting for this section has to be a cost accounting rather than a saving.
 
-The resource budget the winning configuration actually lands on:
-
-| | kernel 11 | kernel 12 |
+| | kernel 10 | kernel 11 |
 |---|---|---|
-| thread tile | 4 x 4 | 16 x 4 |
-| block tile | 128 x 64 | 128 x 128 |
-| accumulators per thread | 64 | 128 |
-| registers per thread | 150 | **227** |
-| shared memory per block | 24832 B | 32768 B |
-| blocks per SM | 3 | **2** |
-| occupancy | 25.0% | **16.7%** |
+| barriers per K-tile | 2 | 1 |
+| shared memory per block | 12416 B | 24832 B |
+| registers per thread | 94 | **150** |
+| blocks per SM | 5 | **3** |
+| binding limit | registers | registers |
+| occupancy | 41.7% | **25.0%** |
 
-Occupancy has now fallen for four kernels in a row while throughput rose every time, from 41.7% at warp tiling to 16.7% here. That trend is the clearest single answer this article has to the question of what these optimizations are actually doing: they are converting warp level parallelism into instruction level parallelism, one register at a time.
+Two stages of shared memory doubles the shared memory, which on its own would still allow 4 blocks per SM inside the 100 KB budget. It is the registers that bind. 150 registers per thread rounds up to 4864 per warp, 19456 per block of four warps, and `65536 / 19456 = 3`. The `aFrag` staging array and the deeper scheduling window the unrolled loop needs are what pushed 94 up to 150.
 
-### A Measurement That Nearly Shipped
+So the trade is explicit: **this kernel spends the residency that made barriers cheap in order to have fewer barriers.** It goes from 5 resident blocks with 2 barriers each to 3 resident blocks with 1 barrier each, and it wins by 8.9%. Both mechanisms were hiding the same latency, and the in-block one turns out to hide it better than the across-block one, which is the same lesson the occupancy discussion at kernel 6 reached from a different direction.
 
-One thing in this kernel's history is worth more than any of the optimizations in it.
+The profiler agrees the barriers stopped mattering. This kernel runs at **3.94 warp cycles per issued instruction against kernel 10's 6.81**, and its largest named stall is `Stall Not Selected` at 38.0%, warps that were ready and simply were not chosen. Nothing is waiting on memory or on a barrier any more; there is more eligible work than there are issue slots.
 
-An earlier version of the `beta == 0` work claimed that `if constexpr` was worth four points over an equivalent runtime `if (beta == 0.0f)` inside the kernel, and had numbers to back it up, and a mechanism to explain it: both epilogues live in one function, so the register allocator has to budget for the worse one. That is a plausible story. It is also wrong.
+It is worth being careful here, because it would be easy to write that this kernel trades shared memory for barriers. It does not. It trades registers for barriers, and the shared memory increase is free. The distinction is measurable in one command, `nvcc -Xptxas -v`, and it changes which knob you would reach for next.
 
-The two variants had been built with different `__launch_bounds__`. The comparison moved two variables at once and attributed the entire difference to the one that was interesting. Re-run with `__launch_bounds__` held fixed:
+### What Could Be Improved
 
-| epilogue selection | throughput | registers |
-|---|---|---|
-| `if constexpr` plus host dispatch | 95.08 / 95.16 / 96.18% | 227 |
-| runtime `if (beta == 0.0f)` | 95.05 / 95.12 / 95.91% | 221 |
+Nothing, on its own terms. This kernel does what it set out to do, and every technique the series has to offer is now in it: coalesced global access, shared memory tiling, two levels of register tiling, warp tiling, vectorized loads, a padded shared buffer, and a software pipeline. There is no eighth technique waiting.
 
-Indistinguishable. All four points belonged to the launch bounds argument.
+What is wrong is older than this kernel. Every configuration decision behind it was made against a kernel that no longer exists.
 
-The `if constexpr` form is kept, because it is the honest way to say "these are two different kernels" and it costs nothing, but it is not why this kernel is fast. The lesson is about method rather than about GEMM: an A/B that changes two things at once produces a real, repeatable and entirely false number, and a plausible mechanism will always suggest itself for whichever of the two changes you were already interested in.
+The tile shape came from a sweep over the non-pipelined kernel, where barriers were expensive and residency was the way to hide them, and that sweep duly picked the small blocks that pack five to an SM. The padding came from a profiler reading taken when the thread tile was `4 x 4` and the load side was narrow, so the store conflicts really were a meaningful share of shared memory traffic. Both decisions were correct when they were made. The pipeline changed what is scarce, and neither of them was revisited.
 
-### What Could Be Improved, And What It Would Take
-
-We are at 3.929 ms against cuBLAS at 3.817 ms, so the remaining gap is 2.9% at `M = N = K = 4096`. Run to run spread on this kernel is 1.17%, so that gap is real but only just.
-
-Several things were tried against it and did not work, and they are worth recording because a negative result measured is more useful than a technique listed:
-
-- **Block rasterization**, grouping blocks into columns so that consecutive blocks share tiles of B, swept over four group sizes. Landed inside noise in both directions. The grid is only 1024 blocks over 84 SMs and L2 is 64 MB, so the reuse the swizzle is designed to create is already there.
-- **Shared memory to register double buffering**, a second pipeline stage inside the `dotIdx` loop. Slower. The loop is fully unrolled at compile time, so `ptxas` already schedules those loads ahead of their FMAs, and hand rolling it only adds indexing.
-- **`BK = 8` and `BK = 32`.** The first halves the reuse of every loaded element and lost around ten points. The second does not fit the 48 KB static shared memory cap once double buffered.
-- **256 thread blocks** in three shapes. All fell to one block per SM and lost six to eleven points.
-
-What would actually close 2.9% is not on the list, because it is not in this series' scope. cuBLAS at this size is running a hand tuned assembly kernel with a schedule no compiler will reproduce from CUDA C, and beyond that it can select tensor core paths that this article deliberately never touches. Every kernel here runs on FP32 CUDA cores, and the 3.817 ms reference is `cublasSgemm` on the same units, which is what makes the comparison fair. Switching to TF32 or FP16 with FP32 accumulation would make this kernel several times faster and would be answering a different question.
-
-One measurement makes the size of that remaining gap concrete. Nsight puts this kernel at **2.55 warp cycles per issued instruction with `Stall Not Selected` at 32.5%**, and cuBLAS's cutlass kernel at **2.55 cycles with Not Selected at 33.3%**. The two stall profiles are indistinguishable. Whatever the last 2.9% is, it is not a stall this kernel suffers and cuBLAS avoids. Both sit in the regime where the scheduler has more eligible warps than it can issue, and what separates them is the instruction schedule itself.
-
-The more honest closing note is about the shape of the ladder rather than its last rung. Twelve kernels moved us from 410.5 GFLOP/s to 34978.3, which is 85 times, and the techniques responsible are not exotic: read memory in the order it is laid out, load each value once per block instead of once per thread, give each thread enough work that its loads amortize, hand the hardware its widest instructions, keep each warp's footprint compact, overlap loading with arithmetic, and then measure everything again because the earlier decisions have gone stale. Almost all of it is data movement, and almost none of it is arithmetic.
-
-The last one deserves the final word. Three separate optimizations in this article were undone or overturned by later ones: the square tile the access count formula recommended, the padding the profiler recommended, and the occupancy that every introductory guide recommends. None of those were mistakes at the time. They stopped being right when the kernel around them changed, and the only way that was ever going to surface was by measuring again.
+Nothing in the code signals that. A stale tuning decision does not throw an error or show up as a stall. It just sits there being a slightly wrong constant, and the only way to find it is to run the search again against the kernel you actually have.

@@ -1,71 +1,67 @@
-## Double Buffering: Software Pipelining the K-Loop
+## Padded Shared Memory: Eliminating Bank Conflicts
 
-Kernel 10 ended with almost nothing left to remove. Roughly 95% of the instructions issued per K-tile are `FFMA`, the loads are vectorized, the tile shape is the best of a measured sweep, and the bank conflicts are gone. And it is still at 81.9% of cuBLAS.
+Nsight's reading on the configuration the sweep chose is specific: **4.2-way bank conflicts on every shared memory store, 68% of store wavefronts affected, and an estimated 46% speedup available if they went away.** That is the largest single number any profiler has produced about any kernel in this series, and it points at four lines of code.
 
-What is left is not work, it is waiting. The K loop has had the same four beats since kernel 4:
+This section is one derivation and one honest result, and the two do not agree with each other.
 
+### How Shared Memory Is Addressed
+
+Shared memory is not one bank of memory, it is 32 of them, interleaved every 4 bytes. The bank holding a float is:
+
+``` latex
+\text{bank} = \left\lfloor \frac{\text{byte address}}{4} \right\rfloor \bmod 32
 ```
-load a tile into shared memory
-__syncthreads()
-compute 16 steps out of shared memory
-__syncthreads()
-```
 
-Those two barriers make the two halves mutually exclusive. While the block is issuing global loads, the FMA pipes have nothing to do, because the data they would need is exactly what is being fetched. While the block is computing, the load pipes have nothing to do. Every SM alternates between two idle resources when it could be using both.
+which for an array of floats is just the array index mod 32. The hardware services one address per bank per cycle. If the 32 lanes of a warp touch 32 different banks the whole access completes in one cycle, and if they all touch the same address the hardware broadcasts, which is also one cycle. The bad case is in between: several lanes wanting different addresses that happen to live in the same bank. Those serialize, and an `n` way conflict costs `n` cycles.
 
-Residency has been papering over this. With 5 blocks per SM, one block stalling at a barrier leaves four others with work to issue, which is a large part of why kernel 8's small blocks beat kernel 7's large ones. But that is latency hiding across blocks, and it only works while there are spare blocks.
-
-The direct fix is to overlap the two phases within a single block. Keep two tiles in shared memory instead of one. Compute on tile `n` while the loads for tile `n + 1` are already in flight, then swap. The loads still cost what they cost; they just happen underneath the arithmetic instead of in front of it.
-
-### Two Stages, One Barrier
-
-Doubling the buffers is what makes the barrier count fall, and the reason is worth stating precisely, because it is the entire correctness argument for the kernel.
-
-With one buffer, the second `__syncthreads()` exists to stop a fast warp from overwriting the tile a slow warp is still reading. With two buffers that hazard is gone by construction: warps read from `As[curStage]` and write into `As[nextStage]`, which are different memory. The only remaining hazard is the original one, that a warp might read a stage before every warp has finished filling it, and that needs one barrier per trip rather than two.
-
-The other half of the mechanism is `cp.async`, which is a Blackwell-era instruction that copies from global memory straight into shared memory without the data passing through registers or through the warp at all. Issue it, keep going, and check later that it landed:
+Now look at where the transposed store puts things. From kernel 7 onwards, A is written into shared memory transposed:
 
 ```cuda
-__device__ __forceinline__ void cp_async16(float *smemDst, const float *gmemSrc) {
-  const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smemDst));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(addr), "l"(gmemSrc));
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-  asm volatile("cp.async.commit_group;\n" ::);
-}
-
-template <int PENDING>
-__device__ __forceinline__ void cp_async_wait() {
-  asm volatile("cp.async.wait_group %0;\n" ::"n"(PENDING));
-}
+As[(innerColA * 4 + j) * BM + innerRowA + offset] = tmp.<x,y,z,w>;
 ```
 
-`cp.async` copies bytes verbatim, which is precisely why only B can use it. `Bs` is stored in the same orientation it is read from global memory, so a straight byte copy is correct. `As` is stored transposed, and a transpose is not a copy: the four floats of a `float4` have to end up in four different rows, `A_STRIDE` apart. That has to pass through a register. So A is prefetched into a `float4` register array early in the loop and written into shared memory late, and B goes global to shared directly with no register involvement.
+The row stride of `As` is `BM = 128`, and 128 is a multiple of 32. So in the bank calculation the entire first term vanishes:
 
-### The Kernel
+``` latex
+\text{bank} = \big((\text{innerColA} \cdot 4 + j) \cdot 128 + \text{innerRowA}\big) \bmod 32 = \text{innerRowA} \bmod 32
+```
 
-The configuration is unchanged from kernels 8 and 10, including the `A_STRIDE` padding inherited from the previous section:
+The column part of the address contributes nothing at all. Every lane's bank is decided entirely by which row of A it is carrying, and that is exactly the index that varies slowest across a warp. With `BK = 16` the load index is `innerRowA = threadIdx.x / (BK / 4) = threadIdx.x / 4`, so the 32 lanes of a warp cover only **8 distinct rows**, four lanes each. Eight banks, four lanes per bank, a 4-way conflict on each of the four stores. Nsight measured 4.2-way, which is that plus the ragged edge of the last warp.
+
+Worth noticing that this got worse as the kernel got better. At kernel 7's `BK = 8` the divisor was 2, so a warp covered 16 rows and the conflict was only 2-way. Doubling `BK` halved the number of distinct rows a warp touches and doubled the conflict.
+
+### The Fix Is One Constant
+
+If the row stride is a multiple of 32 the column term disappears, so make it not a multiple of 32. Pad each row of `As` by a couple of floats, leaving a small hole at the end of every row, and the column term comes back into the bank index:
 
 ```cuda
-const int BM = 128, BN = 64, BK = 16;
-const int WM = 64, WN = 32, WNITER = 2;
-const int TM = 4, TN = 4, NUM_THREADS = 128;
+constexpr int A_STRIDE = BM + (32 / BK) % 8;   // 128 + 2 = 130
+
+__shared__ float As[BK * A_STRIDE];
 ```
+
+With `A_STRIDE = 130` and `130 mod 32 = 2`:
+
+``` latex
+\text{bank} = \big((\text{innerColA} \cdot 4 + j) \cdot 130 + \text{innerRowA}\big) \bmod 32 = \big(2(\text{innerColA} \cdot 4 + j) + \text{innerRowA}\big) \bmod 32
+```
+
+Within a warp `innerColA = threadIdx.x % 4` takes the values 0 through 3, so for a fixed `j` the column term takes the four values `{2j, 8 + 2j, 16 + 2j, 24 + 2j}`, and each of those is offset by one of the 8 values of `innerRowA`. Four groups of eight, 32 distinct banks, no two lanes colliding. The conflict is gone.
+
+The rest of the kernel is kernel 8 with `BM` replaced by `A_STRIDE` in the three places that index `As`, plus the extra 128 bytes of shared memory per block that the padding costs.
 
 ```cuda
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
-sgemm_double_buffered(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+sgemm_padded_smem(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
   const int cRow = blockIdx.y;
   const int cCol = blockIdx.x;
 
-  
   constexpr int A_STRIDE = BM + (32 / BK) % 8;
 
-  __shared__ float As[2][BK * A_STRIDE];
-  __shared__ float Bs[2][BK * BN];
+  __shared__ float As[BK * A_STRIDE];
+  __shared__ float Bs[BK * BN];
 
   const int warpIdx = threadIdx.x / WARPSIZE;
   const int warpCol = warpIdx % (BN / WN);
@@ -86,99 +82,53 @@ sgemm_double_buffered(int M, int N, int K, float alpha, const float *A, const fl
   const int innerRowA = threadIdx.x / (BK / 4);
   const int innerColA = threadIdx.x % (BK / 4);
   constexpr int ROW_STRIDE_A = (NUM_THREADS * 4) / BK;
-  constexpr int A_PASSES = BM / ROW_STRIDE_A;
 
   const int innerRowB = threadIdx.x / (BN / 4);
   const int innerColB = threadIdx.x % (BN / 4);
   constexpr int ROW_STRIDE_B = NUM_THREADS / (BN / 4);
 
-  float4 aFrag[A_PASSES];
-
   float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
   float regM[WMITER * TM] = {0.0f};
   float regN[WNITER * TN] = {0.0f};
 
-#pragma unroll
-  for (int pass = 0; pass < A_PASSES; ++pass)
-    aFrag[pass] = reinterpret_cast<const float4 *>(
-        &A[(innerRowA + pass * ROW_STRIDE_A) * K + innerColA * 4])[0];
-#pragma unroll
-  for (int pass = 0; pass < A_PASSES; ++pass) {
-    const int row = innerRowA + pass * ROW_STRIDE_A;
-    As[0][(innerColA * 4 + 0) * A_STRIDE + row] = aFrag[pass].x;
-    As[0][(innerColA * 4 + 1) * A_STRIDE + row] = aFrag[pass].y;
-    As[0][(innerColA * 4 + 2) * A_STRIDE + row] = aFrag[pass].z;
-    As[0][(innerColA * 4 + 3) * A_STRIDE + row] = aFrag[pass].w;
-  }
-#pragma unroll
-  for (int offset = 0; offset + ROW_STRIDE_B <= BK; offset += ROW_STRIDE_B)
-    cp_async16(&Bs[0][(innerRowB + offset) * BN + innerColB * 4],
-               &B[(innerRowB + offset) * N + innerColB * 4]);
-  cp_async_commit();
-  cp_async_wait<0>();
-  __syncthreads();
-
-  const int numTiles = K / BK;
-  int curStage = 0;
-  for (int tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
-    const int nextStage = curStage ^ 1;
-    const bool hasNextTile = (tileIdx + 1) < numTiles;
-
-    if (hasNextTile) {
-
-      const float *aNext = A + (tileIdx + 1) * BK;
-      const float *bNext = B + (long)(tileIdx + 1) * BK * N;
-#pragma unroll
-      for (int pass = 0; pass < A_PASSES; ++pass)
-        aFrag[pass] = reinterpret_cast<const float4 *>(
-            &aNext[(innerRowA + pass * ROW_STRIDE_A) * K + innerColA * 4])[0];
-#pragma unroll
-      for (int offset = 0; offset + ROW_STRIDE_B <= BK; offset += ROW_STRIDE_B)
-        cp_async16(&Bs[nextStage][(innerRowB + offset) * BN + innerColB * 4],
-                   &bNext[(innerRowB + offset) * N + innerColB * 4]);
-      cp_async_commit();
+  for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+    for (int offset = 0; offset + ROW_STRIDE_A <= BM; offset += ROW_STRIDE_A) {
+      float4 tmp = reinterpret_cast<const float4 *>(
+          &A[(innerRowA + offset) * K + innerColA * 4])[0];
+      As[(innerColA * 4 + 0) * A_STRIDE + innerRowA + offset] = tmp.x;
+      As[(innerColA * 4 + 1) * A_STRIDE + innerRowA + offset] = tmp.y;
+      As[(innerColA * 4 + 2) * A_STRIDE + innerRowA + offset] = tmp.z;
+      As[(innerColA * 4 + 3) * A_STRIDE + innerRowA + offset] = tmp.w;
     }
 
-#pragma unroll
+    for (int offset = 0; offset + ROW_STRIDE_B <= BK; offset += ROW_STRIDE_B) {
+      reinterpret_cast<float4 *>(&Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
+          reinterpret_cast<const float4 *>(&B[(innerRowB + offset) * N + innerColB * 4])[0];
+    }
+    __syncthreads();
+
+    A += BK;
+    B += BK * N;
+
     for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
-#pragma unroll
       for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow)
-#pragma unroll
         for (int i = 0; i < TM; ++i)
           regM[wSubRow * TM + i] =
-              As[curStage][dotIdx * A_STRIDE + warpRow * WM + wSubRow * WSUBM + threadRowInWarp * TM + i];
-#pragma unroll
+              As[dotIdx * A_STRIDE + warpRow * WM + wSubRow * WSUBM + threadRowInWarp * TM + i];
+
       for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol)
-#pragma unroll
         for (int i = 0; i < TN; ++i)
           regN[wSubCol * TN + i] =
-              Bs[curStage][dotIdx * BN + warpCol * WN + wSubCol * WSUBN + threadColInWarp * TN + i];
-#pragma unroll
+              Bs[dotIdx * BN + warpCol * WN + wSubCol * WSUBN + threadColInWarp * TN + i];
+
       for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow)
-#pragma unroll
         for (int wSubCol = 0; wSubCol < WNITER; ++wSubCol)
-#pragma unroll
           for (int m = 0; m < TM; ++m)
-#pragma unroll
             for (int n = 0; n < TN; ++n)
               threadResults[(wSubRow * TM + m) * (WNITER * TN) + wSubCol * TN + n] +=
                   regM[wSubRow * TM + m] * regN[wSubCol * TN + n];
     }
-
-    if (hasNextTile) {
-      
-#pragma unroll
-      for (int pass = 0; pass < A_PASSES; ++pass) {
-        const int row = innerRowA + pass * ROW_STRIDE_A;
-        As[nextStage][(innerColA * 4 + 0) * A_STRIDE + row] = aFrag[pass].x;
-        As[nextStage][(innerColA * 4 + 1) * A_STRIDE + row] = aFrag[pass].y;
-        As[nextStage][(innerColA * 4 + 2) * A_STRIDE + row] = aFrag[pass].z;
-        As[nextStage][(innerColA * 4 + 3) * A_STRIDE + row] = aFrag[pass].w;
-      }
-      cp_async_wait<0>();
-      __syncthreads();   
-    }
-    curStage = nextStage;
+    __syncthreads();
   }
 
   for (int wSubRow = 0; wSubRow < WMITER; ++wSubRow) {
@@ -203,45 +153,43 @@ sgemm_double_buffered(int M, int N, int K, float alpha, const float *A, const fl
 
 ### Mechanics
 
-1. **The prologue is the loop body with the compute removed.** Before the loop can compute on stage 0, something has to fill stage 0, and that is what the three blocks above `numTiles` do. This is the structural cost of software pipelining: the steady state is efficient, and you pay for it with a prologue that has no arithmetic to overlap with, once per block rather than once per tile.
+1. **`(32 / BK) % 8` is a formula, not a magic number.** It asks how many rows of `As` a warp's stores span and pads by enough to walk the bank index off a multiple of 32. At `BK = 16` it gives 2, at `BK = 32` it gives 1, at `BK = 8` it gives 4, and the outer `% 8` keeps the pad small when `BK` is tiny. It is worth re-deriving by hand for any new `BK` rather than trusting it, because the argument above depends on how many distinct values `innerColA` takes, and that moves with `BK` too.
 
-2. **The A prefetch and the A store sit on opposite sides of the compute.** `aFrag` is loaded from global memory at the top of the iteration and written into `As[nextStage]` at the bottom, with 2048 FMAs in between. That gap is the point. A global load has a latency of several hundred cycles, and the arithmetic in the middle is what covers it. Moving those two loops next to each other would compile, run, produce identical results, and lose most of the benefit of the section.
+2. **Padding costs shared memory and nothing else.** `As` goes from `BK x BM x 4 = 8192` bytes to `BK x 130 x 4 = 8320`, so the block total goes from 12288 to 12416 bytes. At 5 blocks per SM that is still far inside the 100 KB budget, and `ptxas` reports 94 registers against kernel 8's 96, so residency stays at 5 blocks per SM and occupancy stays at 41.7%. Nothing was traded away for this.
 
-3. **`cp_async_wait<0>()` waits for all outstanding groups, and the placement matters more than the argument.** It sits immediately before the barrier at the end of the iteration, so the B copies for tile `n + 1` have the entire compute phase to complete in. The `commit_group` right after issuing them is what makes them a group that can be waited on.
+3. **Only the store was conflicted, and the loads were already fine.** `regM` reads `As[dotIdx * A_STRIDE + ...]` over consecutive `i`, which are consecutive floats and therefore consecutive banks. This is worth saying out loud, because it is both the reason the fix is cheap and, as the next paragraphs show, the reason the fix does not pay. The load path runs six times more often than the store path and was never what needed fixing.
 
-4. **`cur ^ 1` rather than `(cur + 1) % 2`.** Both work with two stages. The XOR makes it obvious that the two indices are a pair being swapped rather than a counter being advanced, which matters if the stage count ever goes to 3 and the XOR stops being correct.
+Kernel 10 runs in **4.660 ms at 29490.7 GFLOP/s, which is 81.9% of cuBLAS at `M = N = K = 4096`**, against 4.679 ms and 81.6% for kernel 8. That is a gain of **0.4%**.
 
-5. **`#pragma unroll` on everything.** Every loop in the hot path has a compile-time trip count, and unrolling them is what lets `ptxas` interleave the independent global loads, shared loads and FMAs into a single scheduled block. Without it the pipelining is expressed in the source and then thrown away by the scheduler.
+### 46% Estimated, 0.4% Delivered
 
-Kernel 11 runs in **4.281 ms at 32107.5 GFLOP/s, which is 89.2% of cuBLAS at `M = N = K = 4096`**, up from 4.660 ms and 81.9%. That is 8.9% faster.
+Both of those numbers are real, and reconciling them is the point of this section.
 
-### What The Overlap Cost
+The conflicts were genuinely there. The derivation is arithmetic rather than conjecture: `128 mod 32 = 0` collapses the bank index onto `innerRowA`, and `innerRowA = threadIdx.x / 4` gives 8 rows per warp. The profiler measured 4.2-way against a predicted 4. And the fix genuinely removed them, by the same arithmetic run in reverse.
 
-This is the first optimization in the series that does not reduce anything. Global accesses per output element are still 96 and shared accesses are still `K / 4`, exactly as they were for kernels 8 and 10. The instruction mix is nearly identical. The only thing that changed is when the instructions issue relative to one another, so the accounting for this section has to be a cost accounting rather than a saving.
+What was wrong was the estimate, and specifically the assumption underneath it. Nsight's estimated speedup figures answer a narrow question: if this stall disappeared entirely, how much faster would the unit reporting it run. It has no way to know whether that unit is on the critical path. Here it is not. Count the instructions in one trip around the K loop:
 
-| | kernel 10 | kernel 11 |
+| instruction | count per K-tile | share |
 |---|---|---|
-| barriers per K-tile | 2 | 1 |
-| shared memory per block | 12416 B | 24832 B |
-| registers per thread | 94 | **150** |
-| blocks per SM | 5 | **3** |
-| binding limit | registers | registers |
-| occupancy | 41.7% | **25.0%** |
+| `STS`, the conflicting transposed stores | 16 | 0.7% |
+| `LDS`, the vector loads feeding the FMAs | 96 | 4.4% |
+| `FFMA` | 2048 | 94.9% |
 
-Two stages of shared memory doubles the shared memory, which on its own would still allow 4 blocks per SM inside the 100 KB budget. It is the registers that bind. 150 registers per thread rounds up to 4864 per warp, 19456 per block of four warps, and `65536 / 19456 = 3`. The `aFrag` staging array and the deeper scheduling window the unrolled loop needs are what pushed 94 up to 150.
+The conflicting stores are under 1% of the instruction stream. Removing a 4-way conflict makes them roughly four times cheaper, which removes something like half a percent of the total, and half a percent is what we measured. The 46% was never on the table because the store path was never what the kernel was waiting on.
 
-So the trade is explicit: **this kernel spends the residency that made barriers cheap in order to have fewer barriers.** It goes from 5 resident blocks with 2 barriers each to 3 resident blocks with 1 barrier each, and it wins by 8.9%. Both mechanisms were hiding the same latency, and the in-block one turns out to hide it better than the across-block one, which is the same lesson the occupancy discussion at kernel 6 reached from a different direction.
+The general lesson is about how to read a profiler. It reports where time goes inside each unit accurately, and it estimates the benefit of fixing a stall on the assumption that the stall is what bounds you. That second part is a hypothesis you are supplying, not a measurement it is making. The cheap way to test it before writing any code is the table above: count how often the instruction you are about to optimize actually executes.
 
-The profiler agrees the barriers stopped mattering. This kernel runs at **3.94 warp cycles per issued instruction against kernel 10's 6.81**, and its largest named stall is `Stall Not Selected` at 38.0%, warps that were ready and simply were not chosen. Nothing is waiting on memory or on a barrier any more; there is more eligible work than there are issue slots.
+<!-- TODO: re-run the conflict measurement now the fix is in, to show it landing
+     at 1.0-way: `sudo ncu --metrics
+     l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum ./bench 4096` on
+     kernels 8 and 10. Also want smsp__inst_executed to replace the derived
+     instruction table above with a measured one. Counters are admin only on this
+     box right now. -->
 
-It is worth being careful here, because it would be easy to write that this kernel trades shared memory for barriers. It does not. It trades registers for barriers, and the shared memory increase is free. The distinction is measurable in one command, `nvcc -Xptxas -v`, and it changes which knob you would reach for next.
+Keep the derivation anyway. It is correct, it is the only place in this series where a hardware detail as small as a bank index reaches into a line of code, and padding is the right default for a transposed shared memory buffer. It is also, as the final section of this article discovers, a fix with an expiry date.
 
 ### What Could Be Improved
 
-Nothing, on its own terms. This kernel does what it set out to do, and every technique the series has to offer is now in it: coalesced global access, shared memory tiling, two levels of register tiling, warp tiling, vectorized loads, a padded shared buffer, and a software pipeline. There is no eighth technique waiting.
+The instruction table says something else worth reading twice. `FFMA` is 95% of what this kernel issues per K-tile, and around 83% of everything it executes once loop overhead and the epilogue are counted. There is essentially no overhead left to remove. Every instruction that is not arithmetic has been hoisted, vectorized, tiled or padded away across the last five kernels.
 
-What is wrong is older than this kernel. Every configuration decision behind it was made against a kernel that no longer exists.
-
-The tile shape came from a sweep over the non-pipelined kernel, where barriers were expensive and residency was the way to hide them, and that sweep duly picked the small blocks that pack five to an SM. The padding came from a profiler reading taken when the thread tile was `4 x 4` and the load side was narrow, so the store conflicts really were a meaningful share of shared memory traffic. Both decisions were correct when they were made. The pipeline changed what is scarce, and neither of them was revisited.
-
-Nothing in the code signals that. A stale tuning decision does not throw an error or show up as a stall. It just sits there being a slightly wrong constant, and the only way to find it is to run the search again against the kernel you actually have.
+So the remaining gap is not instructions the kernel executes. It is cycles in which it executes nothing. The K loop is still `load, sync, compute, sync`, and both barriers stall every warp in the block until the slowest one arrives. While the block is loading, the FMA pipes have nothing to do; while it is computing, the load pipes have nothing to do. The work is already minimal and it is still serialized against itself.

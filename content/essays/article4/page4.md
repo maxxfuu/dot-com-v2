@@ -1,85 +1,184 @@
-## Global Memory Coalescing
+## The Naive Kernel: Establishing a Baseline
 
-From the naive kernel implementation, we have established that the kernel loads the right values in a inefficient order. Right now the way we are assigning the global thread index to the row and col variables will result in all of the threads accessing data from the global memory in a non-contiguous manner. 
+For the first kernel, we are really just trying to express GEMM in CUDA. We'll start off assigning the threads to each output cell within the output matrix C. Start by expressing each thread with its respective global thread indices: 
 
-From a warp perspective of matrix A, each thread accesses a different row in memory during 1 lockstep. A thread would access `A[0][k]`, the next thread will access `A[1][k]`, and the next would be `A[2][k]`; each thread within the warp accesses a new row that's K x 4-bytes apart. Thats roughly 16 KB of data. 
+![Each thread computes one element of C, labelled here by the cell it owns as t[row][col]. Thread t[0][0] takes the top-left corner, and stepping one cell right or one cell down moves you exactly one column or one row through the output.](/images/gemm/matrix-c-indexing.png)
 
-From a thread perspective of matrix A, a thread walks along its row and accesses a new element. Suppose thread 0's first iteration accesses `A[0][0]`, the second iteration the thread will access `A[0][1]`. Each time the warp goes through a new iteration it fetches a new element, and each of those fetches pulls in a whole 32 byte sector from the VRAM only to use a 4 byte float. 
+``` cuda 
+const int BLOCKSIZE = 32;
 
-With matrix A, we can conclude that each thread fetching 32 bytes from the VRAM just to use 4 bytes of memory per iteration is wasteful. To enable global memory coalescing we can swap the global thread index assignment of the row and col variables so that `threadIdx.x` maps to col, making col the fastest changing index across a warp. 
-
-Changing the global thread index between the row and col would change how A is accessed. Instead of 32 threads accessing 32 separate rows, all 32 threads will access the same row and same element within a single lockstep. As a result, the hardware serves that one address out of a single sector and broadcasts the value to all 32 lanes/registers. 
-
-![Left: the naive mapping puts threadIdx.x on row, so a warp's 32 lanes land on 32 different rows of A, each K·4 bytes apart in memory - nothing to merge into one transaction. Right: swapping the mapping puts threadIdx.x on col, so all 32 lanes sit on the same row of A and their accesses collapse into a single 128 B segment instead of 32 scattered ones.](/images/gemm/coalescing-access-pattern.png "large")
-
-Matrix B behaves differently with the naive kernel implementation. Initially, the `col` variable is assigned with `threadIdx.y`, which is a constant value across all 32 threads within a warp. What differs across the lanes is row variable with the `threadIdx.x`. Every lane computes the same column element and asks for the same address. The hardware loads one 32 byte sector, uses 4 bytes of it and broadcasts that single float to all 32 registers. Each iteration the threads step down one row on the same column.
-
-With the coalesced kernel for matrix B, all 32 threads read the same row of B during a single lockstep, one thread per adjacent column. Because matrix B is stored in row-major order, those adjacent cells sit sequentially in physical memory. The hardware packs the 128 bytes into 4 consecutive 32 byte sectors. This makes a perfectly coalesced access when matrix B access a whole row. 
-
-![Left: the naive mapping takes col from threadIdx.y, so all 32 lanes of a warp resolve to the same column of B - one address, one 32 B sector loaded, 4 B of it used and the rest of the warp served by broadcast, and each k step walks one row down that same column. Right: taking col from threadIdx.x puts the 32 lanes on 32 adjacent columns of row k - 128 contiguous bytes packed into 4 x 32 B sectors with every byte used, and the whole warp drops one row per k step.](/images/gemm/coalescing-matrix-b.png "large")
-
-### The Kernel
-
-The launch configuration is unchanged from kernel 1. It is `32 x 32` threads per block, one thread per output element, `CEIL_DIV(N, 32) x CEIL_DIV(M, 32)` blocks:
-
-```cuda
-dim3 gridDim(CEIL_DIV(N, BLOCKSIZE), CEIL_DIV(M, BLOCKSIZE), 1);
-dim3 blockDim(BLOCKSIZE, BLOCKSIZE);
-```
-
-The kernel body is unchanged too. The entire delta is which component of `threadIdx` feeds which variable:
-
-```cuda
-// kernel 1: naive
 const int row = blockIdx.y * BLOCKSIZE + threadIdx.x;
 const int col = blockIdx.x * BLOCKSIZE + threadIdx.y;
-
-// kernel 2: coalesced
-const int row = blockIdx.y * BLOCKSIZE + threadIdx.y;
-const int col = blockIdx.x * BLOCKSIZE + threadIdx.x;
 ```
 
-Two lines. Same loop, same arithmetic, same number of loads.
+Given this mapping, a single thread computes the dot product between a row of A and a column of B, then writes the dot product into its corresponding output cell within the C matrix. 
 
-### Mechanics
+So far, we view this kernel as the instruction that is responsible for a single thread. The thread will walk the full K dimension between its corresponding row within `A` and corresponding column within `B`. Written out against our actual function signature, the entire kernel looks like this:
 
-1. **Why `threadIdx.x` is the index that matters.** A block's threads are linearized as `threadIdx.x + blockDim.x * threadIdx.y` before being cut into warps of 32. With `blockDim.x = 32`, a warp is exactly one row of the block: 32 consecutive values of `threadIdx.x` at a single `threadIdx.y`. Whichever variable `threadIdx.x` feeds is the one that varies across a warp, and that variable decides whether the warp's addresses are contiguous. Kernel 1 fed it to `row`; kernel 2 feeds it to `col`.
+```cuda
+#include <cuda_runtime.h>
 
-2. **C moves with the loads.** The swap is usually described in terms of A and B, but `C[row * N + col]` is indexed by the same variables. Its read-back for `beta` and its store both go from 32 sectors to 4. C is touched once per thread rather than once per K iteration, so it barely shows up in the total, but it is the same fix.
+// Ceiling division to round up the dimension of the grid so that blocks can be multiple of 32 threads.
+#define CEIL_DIV(M, N) (((M) + (N) - 1) / (N))
 
-Kernel 2 runs in **47.213 ms at 2911.0 GFLOP/s, which is 8.1% of cuBLAS at `M = N = K = 4096`**, against 334.793 ms and 1.1% for the naive kernel. A 7.1x speedup for a two line change.
+// Enable compile time polymorphism to accept different BLOCKSIZE values
+template <const int BLOCKSIZE>
+__global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A, const float *B, float beta, float *C) {
+  const int row = blockIdx.y * BLOCKSIZE + threadIdx.y;
+  const int col = blockIdx.x * BLOCKSIZE + threadIdx.x;
+  
+  // Check if threads is out of bounds
+  if (row < M && col < N) {
+    float acc = 0.0f;
+    for (int i = 0; i < K; ++i) {
+      acc += A[row * K + i] * B[i * N + col];
+    }
+    C[row * N + col] = alpha * acc + beta * C[row * N + col];
+  }
+}
+```
 
-### Counting Transactions Instead of Accesses
+To visualize this naive kernel:
 
-The access count did not move, so the speedup has to come out of the transactions. Counting sectors per warp per step of the K loop:
+![Two neighbouring threads and the memory each one touches. Both walk the full K dimension, thread 0 reading row 0 of A against column 0 of B, thread 1 reading row 1 against the same column, to produce one element of C each.](/images/gemm/naive-access-pattern.png "large")
 
-| load | naive | coalesced |
-|---|---|---|
-| A | 32 lanes, stride `K x 4` = 16 KB apart, **32 sectors** | one address, broadcast, **1 sector** |
-| B | one address, broadcast, **1 sector** | 32 adjacent floats, 128 B, **4 sectors** |
-| **total** | **33 sectors = 1056 B** | **5 sectors = 160 B** |
+To launch this kernel, we map `blockIdx.x` and `threadIdx.x` to col and `blockIdx.y` and `threadIdx.y` to row, so the `gridDim.x` walks along the `N` dimension and `gridDim.y` walks along the `M` dimension. For M = N = 4096 with BLOCKSIZE = 32, that's gridDim = (128, 128, 1) and blockDim = (32, 32, 1), or 16,384 blocks of 1024 threads, one warp with 32 thread, 1 thread per output element.
 
-That predicts **6.6x fewer bytes moved**, and the measured speedup is 7.1x. The two matrices trade places: A was the scattered one and becomes the broadcast, B was the broadcast and becomes the contiguous one. Only B ends up in the textbook coalesced case, and it is worth seeing what that case looks like from the memory system's side.
+``` cuda 
+const int BLOCKSIZE = 32;
 
-Naive, each lane claims its own 32 byte sector for a single 4 byte value: 32 sectors x 32 bytes = 1024 bytes moved, only 128 bytes of it used, 12.5% efficiency. Once the lanes of a warp are contiguous, one 32 byte sector covers 8 lanes instead of 1: 4 sectors x 32 bytes = 128 bytes moved, all 128 bytes used, 100% efficiency. Same hardware, same 32 byte sector size. The only thing that changed is how many lanes share one sector. 
+// one threadblock per 32x32 tile of C; grid.x walks N, grid.y walks M
+dim3 gridDim(CEIL_DIV(N, BLOCKSIZE), CEIL_DIV(M, BLOCKSIZE), 1);
+dim3 blockDim(BLOCKSIZE, BLOCKSIZE);
 
-<!-- TODO: profiler callout for kernel 2, the measured version of the table above.
-     `sudo ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum ./bench 4096`
-     on kernels 1 and 2. Sectors per request should read ~32 for the naive kernel
-     and 4 for this one. Counters are admin only on this box right now. -->
+sgemm_naive<BLOCKSIZE><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+```
 
-![Naive: one 32 B sector per lane, 1 of 8 slots used. 32 sectors x 32 B = 1024 B moved, only 128 B used, 12.5% efficiency. Coalesced: one 32 B sector per 8 lanes, all 8 slots used. 4 sectors x 32 B = 128 B moved, all 128 B used, 100% efficiency.](/images/gemm/sector-utilization.png "large")
+### Memory Access Pattern
 
-### What Could Be Improved
+The CUDA hardware performs thread linearization when forming the warps within the block. Even though we define the global thread index within the block with dimensions `x` and `y`, the CUDA hardware flattens everything into a single linear index. As a result, the `x` dimension is the fastest-changing dimension within the block. This matters because it dictates how each thread accesses the output cells within the C matrix. In this case, all 32 threads within 1 warp will collectively access a whole row within the C matrix. For each lockstep, each 32 threads walks down the column space, therefore 32 threads for the first lockstep collectively would access the `row 0` within matrix C, and for the second lockstep `row 1`. The exact formula CUDA defines for that linearization is:
 
-The main difference between the naive kernel implementation and the coalesced kernel is that the coalesced version reduces the total hardware transaction making the kernel 7.1% times faster than the naive kernel. But the catch is that the total work done the byte is still the same; the algorithmic workload hasn't changed. To compute one cell in matrix C, we are still doing a `2K` load just to perform the mulitplication and addition to create the dot product.
+``` latex
+\text{Linear Thread ID} =
+\text{threadIdx.x}
++ \text{threadIdx.y} \times \text{blockDim.x}
++ \text{threadIdx.z} \times \text{blockDim.x} \times \text{blockDim.y}
+```
 
-Since the coalesced kernels request and work done is the same compared to the naive kernel, the arithmetic intensity has not changed; it is stuck at `0.25 FLOP/byte`. However the upside to global memory coalescing is that we are increasing the throughput. 
+`CEIL_DIV` is ceiling division, and it exists because the matrix dimensions are not required to be multiples of the block size, so we round the grid up and let the last blocks hang over the "edge". This is also why we have to have the boundary check in place; the `if (row < M && col < N)` guard inside the kernel prevents out-of-bounds threads from accessing garbage memory. In our kernel implementation, `M = N = K = 4096` with `BLOCKSIZE = 32` makes the division exact, but writing the kernel as though it isn't costs one comparison and further prevents bugs related to boundedness.
 
-By aligning the 32 thread memory accesses into adjacent physical addresses, we reduce the number of hardware transactions. A naive kernel reads 32 seperate 32 byte sectors. This is 1024 total bytes moved through the cache path just to deliver 128 useful bytes. Coalescing fixes this by packing 128 useful bytes into 4 perfectly aligned 32-byte sectors. So instead of choking on the Load/Store units with 32 separate transactions we only issue 4 transactions. This relieves the pressure
-on teh L1/L2 cache path. As a reuslt we actaully increase the GFLOP/s since memory requests are now processed in a fraction of a time. Therefore the warp spends less time waiting for data and spends more time computing; which is an increase in computational throughput even though the workload hasn't changed a bit. 
+Running this kernel at M = N = K = 4096 takes **334.8 ms**, which works out to **410.5 GFLOP/s**. This will be our first baseline that we will try to optimize against cuBLAS's `cublasSgemm` implementation. Note that the cuBLAS implementation computes the same product in 3.817 ms at 36,011 GFLOP/s. This puts our FP32 SGEMM naive kernel **performance at 1.1%** of cuBLAS.
 
+### Arithmetic Analysis
 
+A lower bound identifies the fastest runtime achievable under ideal conditions; we are going to establish the compute floor and the memory floor as theoretical lower bounds on how quickly a **theoretical GEMM** can execute, based on the GPU's compute throughput and memory bandwidth.
 
+Given that the output matrix `C` is in the shape of `M x N` output elements, and there are `K` elements per dot-product, and there exists `2` operations (multiplication & addition) when computing the dot-product, the SGEMM has to perform `2 x M x N x K` floating point operations.
 
+Strictly speaking, for `M = N = K = 4096`:
 
+``` latex
+2(4096)^3 = 137.44\text{ GFLOP}
+```
+
+Now throughput in GPU computing is the rate at which a system can complete work. The RTX 5080's peak throughput with FP32 is 56.3 Tera FLOP/s; this means it can retire at most 56.3 trillion floating point operations every second. Pushing this GPU to its absolute limit gives us a theoretical compute floor: 
+
+``` latex 
+T_{\text{compute}} =
+\frac{137.44\text{ GFLOP}}
+{56.3\text{ TFLOP/s}}
+\approx 2.44\text{ ms}
+
+```
+
+Similarly, let's establish the memory floor. Every byte the kernel uses has to come from VRAM, GDDR7 in our case, at least once. For our SGEMM in FP32, each element is `4 bytes`, so a single `4096 x 4096` matrix occupies: 
+
+``` latex
+4096 \times 4096 \times 4\text{ B} = 67.1\text{ MB}
+```
+
+The `C = alpha*AB + beta*C` accumulate form reads `A`, reads `B`, reads `C`, and
+writes `C` back. The scalars cost no traffic of their own, so this is four
+matrix-sized trips through VRAM:
+
+``` latex
+4 \times 67.1\text{ MB} = 268.4\text{ MB}
+```
+
+The RTX 5080 has `960 GB/s` of memory bandwidth, so even at perfect bandwidth
+utilization the traffic alone costs:
+
+``` latex
+T_{\text{memory}} =
+\frac{268.4\text{ MB}}
+{960\text{ GB/s}}
+\approx 0.28\text{ ms}
+```
+
+The GPU overlaps arithmetic with memory traffic rather than serializing them, so these two floors do not add. The kernel is bounded by whichever one is higher:
+
+``` latex
+T \geq \max(T_{\text{compute}}, T_{\text{memory}}) = 2.44\text{ ms}
+```
+
+For now, know that there is no ideal SGEMM kernel with FP32 where dimensions M = N = K = 4096 with this specific GPU can finish in less than **2.44 ms**. With our hand written kernel, SGEMM took 334.8 ms, against a floor of 2.44 ms. It is 137 times slower than the ideal.
+
+Taking the higher of the two floors is not a trick, it is the roofline model from the previous section applied to a whole problem rather than to a kernel. Recall the shape of it: attainable performance is `min(P_peak, AI x BW)`, the ridge point on this card sits at **58.6 FLOP/byte**, and anything below that intensity is memory bound while anything above it is compute bound.
+
+Now we can place two different things on that roofline. First the problem itself. An ideal GEMM reads A, reads B, reads and writes C, which is the 268.4 MB we already counted, and it performs 137.44 GFLOP:
+
+``` latex
+AI_{\text{GEMM}} =
+\frac{137.44\text{ GFLOP}}
+{268.4\text{ MB}}
+\approx 512\text{ FLOP/byte}
+```
+
+512 is far to the right of 58.6, so **GEMM as a problem is compute bound**, by a factor of nearly nine. That is the real reason the compute floor of 2.44 ms won out over the memory floor of 0.28 ms earlier. It also tells us what a good kernel looks like before we write one: matmul has enough reuse available in it that a kernel which exploits that reuse should end up limited by the FP32 units, and every kernel in this article is an attempt to claw back some of that reuse.
+
+Then our actual kernel. Every iteration of the inner loop reads one float from A and one from B, 8 bytes, and performs one multiply and one add, 2 FLOP:
+
+``` latex
+AI_{\text{naive}} =
+\frac{2\text{ FLOP}}
+{8\text{ B}}
+= 0.25\text{ FLOP/byte}
+```
+
+0.25 against a ridge point of 58.6. Our kernel sits **234 times to the left of where it needs to be**, which puts it about as deep into the memory bound region as a kernel can get. The problem it is solving is compute bound and the kernel solving it is memory bound, and that single mismatch is the entire subject of this article.
+
+The model also predicts what that intensity should cost us. At 0.25 FLOP per byte the sloped ceiling sits at `0.25 x 960 GB/s = 240 GFLOP/s`, which works out to 573 ms. We measured 334.8 ms, or 410.5 GFLOP/s, which is 1.7 times faster than the roof says is possible.
+
+Beating the roofline is a sign that one of its assumptions is wrong, and here it is the assumption that every requested byte comes from VRAM. The kernel asks for `2 x M x N x K x 4 B = 549.8 GB` of loads and it does it in 334.8 ms, which is 1642 GB/s of requested bytes against a bus that can only deliver 960. Roughly half of what we ask for never reaches VRAM at all, because the caches are already absorbing it. So the DRAM roofline is not yet the ceiling that binds us. Something closer in is.
+
+That is the honest position after kernel 1. We are memory bound with an intensity 234 times too low, and yet bandwidth is not what we are waiting on. Both of those are true at once, and the second one is the more useful clue.
+
+So really, there's only one question. Where did all this additional time come from and how are we 137 times slower than the theoretical? No single mistake accounts for the whole gap, but the first and the largest of them lies in **transaction**. How many separate chunks the memory system has to fetch to satisfy a single instruction. A memory instruction does not belong to a thread, it belongs to a warp. 
+
+### What Could be Improved
+
+Knowing that `threadIdx.x` is the fastest-changing dimension, warp 0 is `threadIdx.x` 0 through 31 at `threadIdx.y = 0`. And because we mapped `row` to `threadIdx.x`, those 32 lanes hold 32 consecutive **rows** at a single column. The warp maps onto a vertical strip of C, and onto A the same way.
+
+With B, `col` is warp-invariant, so all 32 threads ask for the same element of B. The hardware then broadcasts that one value into all 32 registers for free data reuse.
+
+So, seen from the warp rather than from the thread, the kernel touches memory in three places: two loads on every iteration of the K loop, and a read-modify-write of C once the loop is done.
+
+```
+A[row * K + i]     load    32 addresses, strided by K        -> 32 sectors
+B[i * N + col]     load    col is warp-invariant,
+                           all 32 lanes -> one address       ->  1 sector (broadcast)
+C[row * N + col]   load    32 addresses, 4096 floats apart   -> 32 sectors
+                   store   the same 32 addresses             -> 32 sectors
+```
+
+C shows up twice because `beta * C[row * N + col]` has to read the old value back before the assignment overwrites it, and the read is strided exactly like the write.
+
+![One warp of the block, lanes 0 through 31 of `threadIdx.x`, and the memory each site touches. The load from A walks 32 rows at a stride of K, so the hardware fetches 32 separate cache lines; the load from B is uniform across all 32 lanes, so one value is broadcast into every register.](/images/gemm/inefficient-warp-access.png "large")
+
+Memory comes back from the L1 in `32-byte` sectors. A warp asking for 32 contiguous floats wants `128 bytes`, which is 4 sectors, and 4 is the best any warp can do. Two of our three arrays need 32, and C needs it twice.
+
+Strictly speaking, the traffic to C and the load from A each move **1024 bytes to deliver the 128** the warp actually asked for. Seven eighths of every transaction is fetched, paid for, and thrown away, and A pays it on every one of the `K` iterations. Only the load from B escapes, and it escapes by accident: `col` depends on `blockIdx.x` and `threadIdx.y`, both constant across warp 0, so the hardware hands one sector to all 32 lanes.
+
+One caveat before we carry that number too far. Sectors are traffic between the L1 and the L2, not traffic out of VRAM. Counted as accesses, this kernel asks for `2 x M x N x K x 4 B = 549.8 GB` of loads, and at 960 GB/s that alone would take 573 ms, yet the kernel finishes in 334.8 ms. Running the bound backwards, VRAM cannot have supplied more than `334.8 ms x 960 GB/s = 321 GB` of that, so a little under half of what we ask for never reaches VRAM at all; the cache is already absorbing it. The waste is real, but it is waste in requests, not in DRAM bytes.
+
+It is worth being precise about what this defect is not. We are not loading too many *values*. The access count stays at exactly `2K` **global loads** per output element, one from A and one from B on every trip through the K loop, and the next kernel will not change it by a single load. We are loading the right values in the wrong *order*, and paying 8x the bytes to get them.
