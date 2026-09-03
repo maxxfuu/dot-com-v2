@@ -103,9 +103,15 @@ Threads in the same block can hand data to each other through shared memory and 
 
 ## CUDA Execution Model
 
-In the previous section we briefly dived into the CUDA programming model, that was introduction to the software abstraction to structure parallel code. Now we will dive into the CUDA exeuction model, the governing principles that determine how GPU hardware maps, schedules, and runs the software abstractions. 
+In the section above, we briefly dived into the CUDA programming model. That was introduction to the software abstraction to structure parallel code in CUDA. Now we will dive into the CUDA exeuction model; the governing principles that determine how GPU hardware maps, schedules, and runs the software abstractions. 
 
-On the software level, the thread is the smallest unit of execution. But on the hardware level, the smallest unit of execution is the **warp**: a group of 32 threads that the SM issues instructions for as one. A block is made up of multiple warps - a 1024-thread block is 32 of them.
+Threads and blocks are software abstractions, they are logical groups managed by the driver and the compiler. Warps and SMs are physical silicon hardware units. 
+
+At the hardware level, the smallest unit of execution is the **warp**: a group of 32 threads that the SM issues instructions for as one. Inside each SM, the warp scheduler selects an active warp from the hardware queue, (), and dispatches one instruction to 32 CUDA cores simulatenously. And when the warp runs, the hardware locks down 32 sets of 32-bit registers in the SM's phsyical SRAM register file. 
+
+The GPU stores the thread state on the physical silicon while a block is active on the SM, meaning each thread have its own private registers. This also means that the process of switching between warps within a block takes 0 clock cycles since it doesn't require any swaps in memory. Every thread within the warp has a dedicated register space. The process of context swtiching between warps is literally just a toggles an electron selector to point the execution pipeline from warp to another eligble warp. 
+
+---
 
 ![The SM never schedules a thread on its own. It schedules one of these.](/images/gemm/block-splits-into-warps.png)
 
